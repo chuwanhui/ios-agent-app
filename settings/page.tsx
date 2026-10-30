@@ -32,6 +32,20 @@ const TIERS: { key: ThinkingTier; label: string; desc: string; cost: string }[] 
 ]
 
 
+/** 「长边像素」：空 / 乱填就回到默认 1024；0 表示保留原尺寸。 */
+function imageSizeOf(raw: string): number {
+  const n = parseInt((raw ?? "").trim(), 10)
+  if (!Number.isFinite(n)) return 1024
+  return Math.max(0, n)
+}
+
+/** JPEG 质量：夹在 0.1 ~ 1.0；空 / 乱填回到 0.8。 */
+function imageQualityOf(raw: string): number {
+  const n = parseFloat((raw ?? "").trim())
+  if (!Number.isFinite(n)) return 0.8
+  return Math.min(1, Math.max(0.1, n))
+}
+
 /** 把配置里的 thinkingEnabled + reasoningEffort 反解成档位。 */
 function tierOf(cfg: AgentConfig): ThinkingTier {
   if (!cfg.thinkingEnabled) return "off"
@@ -367,8 +381,9 @@ export function ConfigPage({
       reasoningEffort: next.thinking === "off" ? "" : next.thinking,
       showSteps: next.showSteps,
       imageEnabled: next.imageEnabled,
-      imageMaxSize: Math.max(0, parseInt(next.imageMaxSize, 10) || 1024),
-      imageQuality: Math.min(1, Math.max(0.1, parseFloat(next.imageQuality) || 0.8)),
+      // 注意：0 是合法值（长边 0 = 保留原尺寸），所以不能用 `|| 1024` 兜底。
+      imageMaxSize: imageSizeOf(next.imageMaxSize),
+      imageQuality: imageQualityOf(next.imageQuality),
       tools,
       mcpServers,
       kbEnabled: next.kbEnabled,
@@ -577,7 +592,7 @@ export function ConfigPage({
       <Form>
         <Section
           header={<Text>默认能力</Text>}
-          footer={<Text>这些开关决定新会话默认可以使用哪些能力。每个会话还可以在聊天输入栏单独调整挂载。</Text>}
+          footer={<Text>这里的开关是全局的，改完下一次回答就生效：关掉的能力对应的工具根本不会交给模型。</Text>}
         >
           <Toggle
             title="知识库检索"

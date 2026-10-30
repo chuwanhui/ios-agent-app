@@ -79,9 +79,20 @@ function hintOf(snap: Snapshot): string {
   return snap.needsKey ? "还没填 API Key，点一下去设置" : "点一下开始对话"
 }
 
+/** 本脚本的名字；用户改了脚本名也能点开（兜底「智能体」）。 */
+function scriptName(): string {
+  try {
+    const n: any = (Script as any)?.name
+    if (typeof n === "string" && n.trim() && n.indexOf("scripting-ts") < 0) return n.trim()
+  } catch {
+    // 拿不到就用兜底
+  }
+  return "智能体"
+}
+
 function Launcher() {
   const snap = snapshot()
-  const url = Script.createRunURLScheme("智能体", { from: "widget" })
+  const url = Script.createRunURLScheme(scriptName(), { from: "widget" })
   const small = Widget.family === "systemSmall"
   const hint = hintOf(snap)
   const hintColor = snap.needsKey ? "systemOrange" : "secondaryLabel"

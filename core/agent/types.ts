@@ -145,11 +145,6 @@ export interface AgentConfig {
    * 留空就只能拉公开仓库。
    */
   gitToken?: string
-  /**
-   * 会话级挂载用的临时字段（不会写进配置文件）：只把技能库里这些 id 放进系统提示；
-   * undefined = 用注册表里所有启用的技能。
-   */
-  onlySkillIds?: string[]
 }
 
 /** 「能力」开关的字段名（capabilities.ts 用它声明每个工具归哪个开关管）。 */

@@ -633,9 +633,8 @@ export function setSkillEnabled(id: string, enabled: boolean): void {
  * 渐进式披露：只在系统提示里列出技能名 + 描述，
  * 模型要用时再调 read_skill 读全文。没有可用技能时返回 null。
  */
-export function skillsPrompt(onlyIds?: string[]): string | null {
-  const allow = onlyIds && onlyIds.length > 0 ? new Set(onlyIds) : null
-  const list = listSkills().filter((s) => s.enabled && (!allow || allow.has(s.id)))
+export function skillsPrompt(): string | null {
+  const list = listSkills().filter((s) => s.enabled)
   if (list.length === 0) return null
   const lines = list.map((s) => {
     const desc = s.description ? s.description.replace(/\s+/g, " ").slice(0, 200) : "（没有写描述）"

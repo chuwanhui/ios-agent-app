@@ -86,7 +86,6 @@ function summarizerConfig(cfg: AgentConfig): AgentConfig {
     mcpServers: [],
     kbEnabled: false,
     skillsEnabled: false,
-    onlySkillIds: [],
     maxToolRounds: 1,
     thinkingEnabled: false,
     reasoningEffort: "",

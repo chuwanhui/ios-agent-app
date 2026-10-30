@@ -455,7 +455,7 @@ function buildMessages(
   // 「性格与角色」是唯一的人设来源：身份、说话方式、做事规则全在这一段里。
   if (cfg.persona && cfg.persona.trim()) sys.push(cfg.persona.trim())
   if (cfg.skillsEnabled) {
-    const sp = skillsPrompt(cfg.onlySkillIds)
+    const sp = skillsPrompt()
     if (sp) sys.push(sp)
   }
   if (sys.length > 0) {
@@ -727,7 +727,7 @@ async function buildToolSpecs(
   }
 
   // —— 内置工具：读取用户上传的 skill 详情 ——
-  if (cfg.skillsEnabled && skillsPrompt(cfg.onlySkillIds)) {
+  if (cfg.skillsEnabled && skillsPrompt()) {
     const name = take("read_skill")
     routes.set(name, { kind: "skill" })
     specs.push({
