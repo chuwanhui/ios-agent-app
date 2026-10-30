@@ -48,7 +48,7 @@ export function CapabilitiesPage({ active = true }: { active?: boolean }) {
 
   function patch(p: Partial<AgentConfig>) {
     const next = { ...loadConfig(), ...p }
-    saveConfig(next)
+    void saveConfig(next)
     setCfg(loadConfig())
   }
 

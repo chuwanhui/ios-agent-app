@@ -189,7 +189,7 @@ export async function importSkillFromRepo(
 
   // 令牌顺手存进配置，下次打开技能页就有了
   const cfg = loadConfig()
-  if ((cfg.gitToken ?? "") !== tk) saveConfig({ ...cfg, gitToken: tk })
+  if ((cfg.gitToken ?? "") !== tk) await saveConfig({ ...cfg, gitToken: tk })
 
   let buf: ArrayBuffer | null = null
   let refLabel = ""

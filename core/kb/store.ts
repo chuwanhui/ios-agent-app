@@ -15,9 +15,11 @@ export const KB_INBOX = FileManager.documentsDirectory + "/知识库"
 /** 导入完成的资料归档目录。 */
 export const KB_DONE = KB_INBOX + "/已导入"
 
-const AGENT_DIR = FileManager.appGroupDocumentsDirectory + "/agent"
-const KB_DIR = AGENT_DIR + "/kb"
-const KB_FILE = KB_DIR + "/index.json"
+import { kvJson, kvWriteJson } from "../db/db"
+
+/** 索引在 kv 表里的键（正文分块比较大，但仍然是一条记录整体替换）。 */
+const KB_INDEX_KEY = "kb.index"
+const KB_FOLDERS_KEY = "kb.folders"
 
 export interface KbChunk {
   id: string
@@ -77,19 +79,17 @@ function emptyIndex(): KbIndex {
 let cache: KbIndex | null = null
 let termMemo = new Map<string, Map<string, number>>()
 
-export function loadKbIndex(force = false): KbIndex {
-  if (cache && !force) return cache
+/** 启动时把索引从库里装进内存。 */
+export async function hydrateKb(): Promise<void> {
   let idx = emptyIndex()
   try {
-    if (FileManager.existsSync(KB_FILE)) {
-      const parsed = JSON.parse(FileManager.readAsStringSync(KB_FILE)) as KbIndex
-      if (parsed && Array.isArray(parsed.chunks) && Array.isArray(parsed.docs)) {
-        idx = {
-          version: 1,
-          docs: parsed.docs,
-          chunks: parsed.chunks,
-          updatedAt: parsed.updatedAt ?? 0,
-        }
+    const parsed = await kvJson<KbIndex>(KB_INDEX_KEY)
+    if (parsed && Array.isArray(parsed.chunks) && Array.isArray(parsed.docs)) {
+      idx = {
+        version: 1,
+        docs: parsed.docs,
+        chunks: parsed.chunks,
+        updatedAt: parsed.updatedAt ?? 0,
       }
     }
   } catch {
@@ -97,19 +97,24 @@ export function loadKbIndex(force = false): KbIndex {
   }
   cache = idx
   termMemo = new Map()
-  return idx
+}
+
+/**
+ * 读索引（同步，走内存）。`force` 保留是为了兼容老调用点：
+ * 现在所有写入都会即时更新内存，不存在「内存比库旧」的情况。
+ */
+export function loadKbIndex(_force = false): KbIndex {
+  return cache ?? emptyIndex()
 }
 
 export function saveKbIndex(idx: KbIndex): void {
   idx.updatedAt = Date.now()
-  try {
-    FileManager.createDirectorySync(KB_DIR, true)
-    FileManager.writeAsStringSync(KB_FILE, JSON.stringify(idx))
-  } catch {
-    // 写不进去也不该让对话崩掉
-  }
   cache = idx
   termMemo = new Map()
+  void kvWriteJson(KB_INDEX_KEY, idx).catch((e) => {
+    // 写不进去也不该让对话崩掉
+    console.log("保存知识库索引失败：" + (e?.message ?? String(e)))
+  })
 }
 
 export function kbStats(): { docs: number; chunks: number; chars: number } {
@@ -362,36 +367,32 @@ export interface KbFolder {
   addedAt: number
 }
 
-const FOLDER_FILE = KB_DIR + "/folders.json"
 const FOLDER_SKIP = ["node_modules", ".git", ".obsidian", ".trash", "已导入", "Library"]
 const FOLDER_MAX_FILES = 300
 const FOLDER_MAX_DEPTH = 5
 
 let folderCache: KbFolder[] | null = null
 
-export function listKbFolders(): KbFolder[] {
-  if (folderCache) return folderCache
+export async function hydrateKbFolders(): Promise<void> {
   let out: KbFolder[] = []
   try {
-    if (FileManager.existsSync(FOLDER_FILE)) {
-      const parsed = JSON.parse(FileManager.readAsStringSync(FOLDER_FILE))
-      if (Array.isArray(parsed)) out = parsed as KbFolder[]
-    }
+    const parsed = await kvJson<KbFolder[]>(KB_FOLDERS_KEY)
+    if (Array.isArray(parsed)) out = parsed
   } catch {
     out = []
   }
   folderCache = out
-  return out
+}
+
+export function listKbFolders(): KbFolder[] {
+  return folderCache ?? []
 }
 
 function saveKbFolders(list: KbFolder[]): void {
-  try {
-    FileManager.createDirectorySync(KB_DIR, true)
-    FileManager.writeAsStringSync(FOLDER_FILE, JSON.stringify(list))
-  } catch {
-    // ignore
-  }
   folderCache = list
+  void kvWriteJson(KB_FOLDERS_KEY, list).catch((e) => {
+    console.log("保存知识库文件夹失败：" + (e?.message ?? String(e)))
+  })
 }
 
 export function addKbFolder(bookmark: string, label: string, path: string): KbFolder {

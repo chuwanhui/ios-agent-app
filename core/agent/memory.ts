@@ -1,4 +1,5 @@
 import { AgentConfig, ChatMessage, Session } from "./store"
+import { MEMORY_COMPRESS_TASK, MEMORY_SUMMARY_PROMPT } from "./prompts"
 import { runAgent } from "./core"
 
 /**
@@ -79,9 +80,8 @@ export function capMessagesForSend(messages: ChatMessage[], maxHistory: number):
 function summarizerConfig(cfg: AgentConfig): AgentConfig {
   return {
     ...cfg,
-    systemPrompt:
-      "你是对话记忆压缩器。把对话压缩成便于后续回答的长期记忆。只保留事实、偏好、约束、待办与未解决问题。输出中文要点。",
-    persona: "",
+    // 压缩器借用 persona 当临时身份（提示词只有这一个入口），跑完就丢。
+    persona: MEMORY_SUMMARY_PROMPT,
     tools: [],
     mcpServers: [],
     kbEnabled: false,
@@ -115,14 +115,7 @@ export async function compressHistory(
     .join("\n\n")
   if (!transcript.trim()) return { ...session, messages: msgs }
 
-  const prompt =
-    "请压缩下面这段历史对话为“后续可用的记忆摘要”。\n" +
-    "要求：\n" +
-    "1) 保留人设偏好、业务事实、约束规则、当前目标；\n" +
-    "2) 删除寒暄和重复内容；\n" +
-    "3) 用 8~15 条要点输出。\n\n" +
-    "历史对话：\n" +
-    transcript
+  const prompt = MEMORY_COMPRESS_TASK + "\n\n历史对话：\n" + transcript
 
   let summary = ""
   try {

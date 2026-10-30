@@ -190,12 +190,7 @@ function ProviderListRow(props: {
       status={props.active ? "当前" : undefined}
       statusColor="systemBlue"
       onOpen={() => pushRoute(props.route)}
-      trailingSwipeActions={{
-        allowsFullSwipe: false,
-        actions: [
-          <Button title="删除" role="destructive" action={props.onDelete} />,
-        ],
-      }}
+      onDelete={props.onDelete}
     />
   )
 }

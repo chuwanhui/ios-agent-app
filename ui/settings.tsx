@@ -1,4 +1,4 @@
-import { CommonViewProps, EmptyView, HStack, Image, ShapeStyle, Spacer, Text, VStack } from "scripting"
+import { Button, EmptyView, HStack, Image, ShapeStyle, Spacer, Text, VStack } from "scripting"
 
 export interface SettingsIconSpec {
   name: string
@@ -56,7 +56,7 @@ export function SettingsNavRow({
 }
 
 export function SettingsListRow({
-  icon, title, detail, status, statusColor = "secondaryLabel", onOpen, trailingSwipeActions,
+  icon, title, detail, status, statusColor = "secondaryLabel", onOpen, onDelete,
 }: {
   icon?: SettingsIconSpec
   title: string
@@ -64,7 +64,13 @@ export function SettingsListRow({
   status?: string
   statusColor?: ShapeStyle
   onOpen: () => void
-  trailingSwipeActions?: CommonViewProps["trailingSwipeActions"]
+  /**
+   * 左滑删除。传了就有「删除」动作。
+   *
+   * 按钮必须在这里生成、不能由调用方传进来：调用方传 JSX 的话，滑动内容和这一行
+   * 属于两个不同的组件，运行时会把同一个动作挂两遍，左滑出来是两个「删除」。
+   */
+  onDelete?: () => void
 }) {
   return (
     <HStack
@@ -73,7 +79,14 @@ export function SettingsListRow({
       frame={{ maxWidth: "infinity", alignment: "leading" }}
       contentShape="rect"
       onTapGesture={onOpen}
-      trailingSwipeActions={trailingSwipeActions}
+      trailingSwipeActions={
+        onDelete
+          ? {
+              allowsFullSwipe: false,
+              actions: [<Button title="删除" role="destructive" action={onDelete} />],
+            }
+          : undefined
+      }
     >
       {icon ? <SettingsIcon spec={icon} /> : <EmptyView />}
       <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" }}>

@@ -59,7 +59,7 @@ function sleep(ms: number): Promise<void> {
 async function waitQueueLock(owner: string, timeoutMs = LOCK_WAIT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() <= deadline) {
-    if (acquireQueueLock(owner)) return true
+    if (await acquireQueueLock(owner)) return true
     await sleep(LOCK_SPIN_MS)
   }
   return false
@@ -85,8 +85,8 @@ export async function processNotification(cfg: AgentConfig, envelope: NotifyEnve
   const runtimeCfg: AgentConfig = compressed.memorySummary
     ? {
         ...cfg,
-        systemPrompt:
-          cfg.systemPrompt +
+        persona:
+          (cfg.persona ?? "") +
           "\n\n【该发件人的历史记忆摘要】\n" +
           compressed.memorySummary +
           "\n请将其作为背景，优先响应最后一条消息。",
@@ -102,7 +102,7 @@ export async function processNotification(cfg: AgentConfig, envelope: NotifyEnve
   )
 
   const capped = withStampedMessages(capMessagesForSend(newHistory, cfg.maxHistory))
-  saveStore(
+  await saveStore(
     upsertSession({ ...store, currentId: compressed.id }, {
       ...compressed,
       title: titleForNotification(envelope.app, envelope.sender),
@@ -153,7 +153,7 @@ export async function drainNotifications(opts?: {
   let heartbeat: any = null
   const beat = () => {
     if (!beating) return
-    refreshQueueLock(owner)
+    void refreshQueueLock(owner)
     heartbeat = setTimeout(beat, LOCK_HEARTBEAT_MS)
   }
   heartbeat = setTimeout(beat, LOCK_HEARTBEAT_MS)
@@ -183,7 +183,7 @@ export async function drainNotifications(opts?: {
   } finally {
     beating = false
     if (heartbeat != null) clearTimeout(heartbeat)
-    releaseQueueLock(owner)
+    await releaseQueueLock(owner)
   }
 
   return {

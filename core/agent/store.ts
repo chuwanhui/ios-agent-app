@@ -8,6 +8,7 @@
  */
 export * from "./types"
 export * from "./defaults"
+export * from "./prompts"
 export * from "./paths"
 export * from "./mcp_json"
 export * from "./provider"

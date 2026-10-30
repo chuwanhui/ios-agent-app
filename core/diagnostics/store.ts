@@ -1,4 +1,4 @@
-import { AGENT_DIR } from "../agent/paths"
+import { all, exec, tx } from "../db/db"
 
 /**
  * 运行诊断：每跑一轮（聊天 / 通知 / 回传续跑 / 记忆压缩）就在本地记一条。
@@ -35,43 +35,52 @@ export interface RunLogEntry {
   error?: string
 }
 
-const RUN_LOG_FILE = AGENT_DIR + "/diagnostics.json"
 /** 只留最近这么多条：诊断是给「刚刚出了什么事」用的，不做长期留存。 */
 const MAX_ENTRIES = 120
 /** 错误摘要的长度上限。 */
 const ERROR_CLIP = 200
 
-export function loadRunLog(): RunLogEntry[] {
-  try {
-    const parsed = JSON.parse(FileManager.readAsStringSync(RUN_LOG_FILE))
-    const list = Array.isArray(parsed) ? parsed : parsed?.entries
-    if (!Array.isArray(list)) return []
-    return list
-      .filter((e: any) => e && typeof e === "object" && typeof e.at === "number")
-      .map((e: any) => e as RunLogEntry)
-  } catch {
-    return []
+/** 内存副本（启动时由 hydrateRunLog 填好），按时间倒序。 */
+let cache: RunLogEntry[] | null = null
+
+export async function hydrateRunLog(): Promise<void> {
+  const rows = await all<{ data: string }>(
+    "SELECT data FROM runs ORDER BY at DESC LIMIT ?",
+    [MAX_ENTRIES],
+  )
+  const list: RunLogEntry[] = []
+  for (const row of rows) {
+    try {
+      const entry = JSON.parse(row.data)
+      if (entry && typeof entry.at === "number") list.push(entry as RunLogEntry)
+    } catch {
+      // 坏行跳过
+    }
   }
+  cache = list
+}
+
+export function loadRunLog(): RunLogEntry[] {
+  return (cache ?? []).slice()
 }
 
 /** 记一条。永远不抛错：诊断写失败不能影响正常对话。 */
 export function logRun(entry: RunLogEntry): void {
-  try {
-    const list = loadRunLog()
-    list.unshift(entry)
-    FileManager.createDirectorySync(AGENT_DIR, true)
-    FileManager.writeAsStringSync(RUN_LOG_FILE, JSON.stringify(list.slice(0, MAX_ENTRIES)))
-  } catch {
+  cache = [entry, ...(cache ?? [])].slice(0, MAX_ENTRIES)
+  void tx([
+    { sql: "INSERT INTO runs (at, data) VALUES (?, ?)", args: [entry.at, JSON.stringify(entry)] },
+    {
+      sql: "DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY at DESC LIMIT ?)",
+      args: [MAX_ENTRIES],
+    },
+  ]).catch(() => {
     // 写不进去就算了
-  }
+  })
 }
 
 export function clearRunLog(): void {
-  try {
-    if (FileManager.existsSync(RUN_LOG_FILE)) FileManager.removeSync(RUN_LOG_FILE)
-  } catch {
-    // ignore
-  }
+  cache = []
+  void exec("DELETE FROM runs").catch(() => {})
 }
 
 /** 错误信息压成一行，避免把整段堆栈写进诊断文件。 */

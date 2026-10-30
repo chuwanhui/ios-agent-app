@@ -74,7 +74,7 @@ export function capCreateShortcutTool(): Capability {
       if (args?.returns === true) tool.returns = true
 
       try {
-        saveConfig({ ...cfg, tools: [...(cfg.tools ?? []), tool] })
+        await saveConfig({ ...cfg, tools: [...(cfg.tools ?? []), tool] })
       } catch (e: any) {
         return fail(`写配置失败：${e?.message ?? String(e)}`)
       }

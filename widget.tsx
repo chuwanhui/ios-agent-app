@@ -1,6 +1,7 @@
 import { HStack, Image, Script, Spacer, Text, VStack, Widget } from "scripting"
 import { loadConfig, loadStore } from "./core/agent/store"
 import { Avatar } from "./ui/avatar"
+import { initStorage } from "./core/db/init"
 
 /**
  * 主屏启动器：桌面上的「智能体」卡片，点一下就进聊天页。
@@ -135,4 +136,8 @@ function Launcher() {
   )
 }
 
-Widget.present(<Launcher />)
+// 小组件也是独立进程：先把配置 / 会话读进内存，再画卡片（所以是 async IIFE）。
+void (async () => {
+  await initStorage()
+  Widget.present(<Launcher />)
+})()

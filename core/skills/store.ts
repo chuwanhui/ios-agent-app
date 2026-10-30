@@ -9,13 +9,17 @@
  * 模型真正要用时再调 read_skill 工具读完整说明，省 token。
  */
 
+import { kvJson, kvWriteJson } from "../db/db"
+
 /** 用户丢技能包的目录（在「文件」App 里可见）。 */
 export const SKILL_INBOX = FileManager.documentsDirectory + "/技能"
 export const SKILL_DONE = SKILL_INBOX + "/已导入"
 
 const AGENT_DIR = FileManager.appGroupDocumentsDirectory + "/agent"
+/** 技能包正文目录（文件，不动）。 */
 const SKILLS_DIR = AGENT_DIR + "/skills"
-const SKILL_REG_FILE = AGENT_DIR + "/skills.json"
+/** 注册表在 kv 表里的键。 */
+const SKILL_REG_KEY = "skills.registry"
 const SKILL_FILE = "SKILL.md"
 
 const MAX_FILES = 300
@@ -58,20 +62,8 @@ function emptyRegistry(): SkillRegistry {
   return { version: 1, skills: [] }
 }
 
-export function loadRegistry(force = false): SkillRegistry {
-  if (cache && !force) return cache
-  let reg = emptyRegistry()
-  try {
-    if (FileManager.existsSync(SKILL_REG_FILE)) {
-      const parsed = JSON.parse(FileManager.readAsStringSync(SKILL_REG_FILE)) as SkillRegistry
-      if (parsed && Array.isArray(parsed.skills)) {
-        reg = { version: 1, skills: parsed.skills }
-      }
-    }
-  } catch {
-    reg = emptyRegistry()
-  }
-  // 注册表里 id 重复或缺失会让所有技能共用同一个详情页，加载时就地修好。
+/** 注册表里 id 重复或缺失会让所有技能共用同一个详情页，加载时就地修好。 */
+function repairRegistry(reg: SkillRegistry): SkillRegistry {
   let repaired = false
   const seen = new Set<string>()
   for (const s of reg.skills) {
@@ -84,19 +76,38 @@ export function loadRegistry(force = false): SkillRegistry {
     }
     seen.add(String(s.id))
   }
-  cache = reg
-  if (repaired) saveRegistry(reg)
-  return reg
+  return repaired ? { version: 1, skills: reg.skills } : reg
+}
+
+/** 启动时把注册表从库里装进内存。 */
+export async function hydrateSkills(): Promise<void> {
+  let reg = emptyRegistry()
+  try {
+    const parsed = await kvJson<SkillRegistry>(SKILL_REG_KEY)
+    if (parsed && Array.isArray(parsed.skills)) reg = { version: 1, skills: parsed.skills }
+  } catch {
+    reg = emptyRegistry()
+  }
+  const repaired = repairRegistry(reg)
+  cache = repaired
+  if (repaired !== reg) saveRegistry(repaired)
+}
+
+/** 读注册表（同步，走内存）。`force` 只为兼容老调用点保留。 */
+export function loadRegistry(_force = false): SkillRegistry {
+  if (cache) return cache
+  let reg = emptyRegistry()
+  const repaired = repairRegistry(reg)
+  cache = repaired
+  if (repaired !== reg) saveRegistry(repaired)
+  return repaired
 }
 
 export function saveRegistry(reg: SkillRegistry): void {
-  try {
-    FileManager.createDirectorySync(AGENT_DIR, true)
-    FileManager.writeAsStringSync(SKILL_REG_FILE, JSON.stringify(reg))
-  } catch {
-    // ignore
-  }
   cache = reg
+  void kvWriteJson(SKILL_REG_KEY, reg).catch((e) => {
+    console.log("保存技能注册表失败：" + (e?.message ?? String(e)))
+  })
 }
 
 export function listSkills(): SkillMeta[] {

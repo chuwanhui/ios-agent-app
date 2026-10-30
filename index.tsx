@@ -6,6 +6,7 @@ import { RecordsPage } from "./records/page"
 import { loadStore, pruneOrphanImages } from "./core/agent/store"
 import { drainNotifications } from "./core/notify/drain"
 import { openRootRoute, willSwitchTabOnRoot } from "./app/nav_route"
+import { initStorage } from "./core/db/init"
 
 function AgentApp() {
   const [tabIndex, setTabIndex] = useState(0)
@@ -60,6 +61,9 @@ function AgentApp() {
 }
 
 async function run() {
+  // 第一件事：把数据库里的配置 / 会话 / 索引读进内存，后面所有同步读才拿得到数据。
+  await initStorage()
+
   // 启动清理：删会话 / 裁剪历史不会自动删聊天图片，这里扫一遍没人引用的文件。
   try {
     pruneOrphanImages(loadStore())

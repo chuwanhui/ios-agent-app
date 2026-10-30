@@ -1,11 +1,11 @@
 import {
   Button, DirectoryBrowserView, HStack, Image, Navigation, NavigationStack, ScrollView, Spacer, Text, Toolbar, ToolbarItem, VStack, ZStack,
-  useState,
+  useEffect, useState,
 } from "scripting"
 import {
   AgentConfig, ChatMessage, Session, SessionStore, activeProvider,
   deriveTitle, ensureWorkspace, loadConfig, loadStore, makeSession, removeSessionWithImages, saveChatImage,
-  saveConfig, saveStore, upsertSession, withCurrentSession,
+  saveConfig, saveStore, subscribeConfig, upsertSession, withCurrentSession,
 } from "../core/agent/store"
 import { capMessagesForSend, compressHistory } from "../core/agent/memory"
 import { continueAgentFromHistory, runAgent } from "../core/agent/core"
@@ -30,6 +30,8 @@ interface Props {
 export function ChatPage({ embedded = false, onOpenSettings }: Props) {
   const dismiss = Navigation.useDismiss()
   const [cfg, setCfg] = useState<AgentConfig>(() => loadConfig())
+  // 设置页改了配置（头像 / 名字 / 模型…）立刻同步到这一页，不然界面还显示旧快照。
+  useEffect(() => subscribeConfig(() => setCfg(loadConfig())), [])
   const [store, setStore] = useState<SessionStore>(() => withCurrentSession(loadStore()).store)
   const [input, setInput] = useState("")
   const [showSettings, setShowSettings] = useState(false)
@@ -59,8 +61,9 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
   /** 界面上画出来的消息：hidden 只用于兼容旧历史，不再写入新消息。 */
   const visible = messages.filter((m) => !m.hidden)
 
+  /** 先落库再喂给界面：落库是异步的，但内存已即时更新，所以界面不会等它。 */
   function apply(next: SessionStore) {
-    saveStore(next)
+    void saveStore(next)
     setStore(next)
   }
 
@@ -161,7 +164,7 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
   function selectModel(id: string) {
     if (!id || id === cfg.activeProviderId) return
     const next: AgentConfig = { ...cfg, activeProviderId: id }
-    saveConfig(next)
+    void saveConfig(next)
     setCfg(loadConfig())
   }
 

@@ -1,7 +1,9 @@
-import { Button, Form, HStack, Section, Spacer, Text, VStack, useState } from "scripting"
+import { Button, Form, HStack, Section, Spacer, Text, VStack, useEffect, useState } from "scripting"
 import {
   RunLogEntry, RunSource, clearRunLog, loadRunLog, runLogStats,
 } from "../core/diagnostics/store"
+import { compactDb, dbPath, dbStats } from "../core/db/db"
+import { storageDegraded } from "../core/db/init"
 import { SettingsEmptyRow, SettingsSummaryRow } from "../ui/settings"
 
 /**
@@ -38,6 +40,13 @@ function stamp(ms: number): string {
 function fmtMs(ms: number): string {
   if (ms < 1000) return ms + " 毫秒"
   return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + " 秒"
+}
+
+/** 字节 → 「1.2 MB」。 */
+function fmtBytes(n: number): string {
+  if (n < 1024) return n + " B"
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB"
+  return (n / 1024 / 1024).toFixed(1) + " MB"
 }
 
 function fmtTokens(n: number): string {
@@ -78,11 +87,35 @@ function RunRow({ entry }: { entry: RunLogEntry }) {
   )
 }
 
+interface StorageInfo {
+  bytes: number
+  sessions: number
+  records: number
+  runs: number
+}
+
 export function DiagnosticsPage() {
   const [entries, setEntries] = useState<RunLogEntry[]>(() => loadRunLog())
+  const [storage, setStorage] = useState<StorageInfo | null>(null)
 
   function refresh() {
     setEntries(loadRunLog())
+    void dbStats()
+      .then((s) => setStorage(s))
+      .catch(() => setStorage(null))
+  }
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  async function compact() {
+    try {
+      await compactDb()
+      refresh()
+    } catch (e: any) {
+      Dialog.alert({ message: "整理失败：" + (e?.message ?? String(e)) })
+    }
   }
 
   async function clearAll() {
@@ -170,6 +203,38 @@ export function DiagnosticsPage() {
             ))}
           </Section>
         ) : null}
+
+        <Section
+          header={<Text>数据存在哪</Text>}
+          footer={
+            <Text>
+              配置、聊天记录、通知记录、索引、队列全在这一个 SQLite 文件里；Key 不在这里，它在系统钥匙串。
+            </Text>
+          }
+        >
+          <VStack spacing={3} padding={{ vertical: 4 }}>
+            <Text font="footnote" foregroundStyle="secondaryLabel" lineLimit={2}>
+              {dbPath()}
+            </Text>
+            {storageDegraded() ? (
+              <Text font="caption2" foregroundStyle="systemRed">
+                本次没能打开数据库，改动只在内存里，退出后就没了。检查一下手机存储空间。
+              </Text>
+            ) : null}
+            {storage ? (
+              <Text font="caption2" foregroundStyle="tertiaryLabel">
+                {`${fmtBytes(storage.bytes)} · 会话 ${storage.sessions} 个 · 通知记录 ${storage.records} 条 · 诊断 ${storage.runs} 条`}
+              </Text>
+            ) : (
+              <Text font="caption2" foregroundStyle="tertiaryLabel">读取中…</Text>
+            )}
+          </VStack>
+          <Button
+            title="整理数据库（VACUUM）"
+            systemImage="arrow.triangle.2.circlepath"
+            action={compact}
+          />
+        </Section>
 
         <Section>
           <Button title="刷新" systemImage="arrow.clockwise" action={refresh} />

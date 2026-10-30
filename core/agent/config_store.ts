@@ -1,18 +1,49 @@
 /**
- * 配置的读 / 写 / 迁移：
- *   - 密钥进 Keychain，config.json 里只留脱敏版本；
- *   - 读出来把老配置（没有供应商列表、旧默认提示词）就地升级；
- *   - 支持快捷指令直接传一段配置 JSON 来改。
+ * 配置的读 / 写 / 迁移。
+ *
+ * 配置在 `agent.sqlite` 的 `kv` 表（key = `config`）。读走内存（启动时水合），
+ * 写先改内存再落库。密钥不进库也不进文件，只进 Keychain，库里存的是脱敏版本。
  */
 import { AgentConfig } from "./types"
-import { DEFAULT_CONFIG, DEFAULT_PERSONA, DEFAULT_SYSTEM_PROMPT } from "./defaults"
-import { AGENT_DIR, CONFIG_FILE } from "./paths"
-import { keychainGet, keychainSet, recoverAtomicFile, writeJsonAtomically } from "./file_io"
-import {
-  mergeConfigPatch, syncActiveProvider, withLegacyProvider,
-} from "./provider"
+import { DEFAULT_CONFIG } from "./defaults"
+import { DEFAULT_PERSONA } from "./prompts"
+import { keychainGet, keychainSet } from "./keychain"
+import { mergeConfigPatch, syncActiveProvider, withLegacyProvider } from "./provider"
+import { kvJson, kvWriteJson } from "../db/db"
 
-/** 从 Keychain 注入密钥，并兼容迁移旧版 config.json 中的明文密钥。 */
+const KV_KEY = "config"
+
+/** 配置的内存副本（启动时由 hydrateConfig 填好）。 */
+let cache: AgentConfig | null = null
+
+/**
+ * 配置变化的订阅者。
+ *
+ * 为什么需要：配置是「一个进程一份内存缓存」，但同进程里多个页面各自 useState 存了
+ * 一份快照。设置页改了头像 / 名字，聊天页那份快照就是旧的，看起来像「没保存」。
+ * 谁改了配置，就通过这里通知所有还活着的页面重新 loadConfig()。
+ */
+const listeners = new Set<() => void>()
+
+/** 订阅配置变化，返回取消订阅的函数。 */
+export function subscribeConfig(cb: () => void): () => void {
+  listeners.add(cb)
+  return () => {
+    listeners.delete(cb)
+  }
+}
+
+function notifyConfigChanged(): void {
+  for (const cb of Array.from(listeners)) {
+    try {
+      cb()
+    } catch (e: any) {
+      console.log("配置订阅回调失败：" + (e?.message ?? String(e)))
+    }
+  }
+}
+
+/** 从 Keychain 注入密钥，并兼容迁移旧版配置里的明文密钥。 */
 function hydrateSecrets(cfg: AgentConfig): AgentConfig {
   return {
     ...cfg,
@@ -28,7 +59,7 @@ function hydrateSecrets(cfg: AgentConfig): AgentConfig {
   }
 }
 
-/** 先写 Keychain，再返回可安全写入 config.json 的脱敏对象。 */
+/** 先写 Keychain，再返回可安全落库的脱敏对象。 */
 function redactSecrets(cfg: AgentConfig): AgentConfig {
   for (const p of cfg.providers ?? []) keychainSet("provider/" + p.id, p.apiKey)
   for (const s of cfg.mcpServers ?? []) keychainSet("mcp/" + s.id, s.token)
@@ -44,61 +75,83 @@ function redactSecrets(cfg: AgentConfig): AgentConfig {
   }
 }
 
-/**
- * 历史版的默认系统提示词：老配置里存的还是它们，加载时静默换成新的
- * （用户自己改过的提示词不动）。
- */
-const LEGACY_DEFAULT_SYSTEM_PROMPTS = [
-  "你是一个运行在用户手机上的智能体助手，可以调用用户的快捷指令和 MCP 工具来帮他完成任务。工具返回的结果就是事实，不要编造执行结果。回答请简洁、友好，使用中文。",
-  "你是一个运行在用户手机上的智能体助手，可以调用用户的快捷指令、MCP 工具和本地知识库来帮他完成任务。工具返回的结果就是事实，不要编造。回答用中文，简洁一点，可以用 Markdown 排版。",
-  "你是一个运行在用户手机上的智能体助手，能调用用户的快捷指令、MCP 工具、本地知识库和技能来帮他完成任务，也能读写文件、跑本机命令行、把结果落成文件交给他保存。\n\n【工作方式 — 必须严格遵循】\n每一轮回答必须按这个流程走：\n1️⃣ 先分析用户意图：他想做什么？需要哪些信息或操作？\n2️⃣ 决定调用什么工具：看看有哪些可用工具，选出能完成任务的。\n3️⃣ 逐个调用工具：真的去调，不要只说「我来做」。必须产生 tool_calls 去执行。\n4️⃣ 拿到结果后再回答：用工具返回的实际结果来组织最终答案。\n\n【关键规则】\n- 需要操作手机或获取信息时，必须调用工具，不要凭空编造。\n- 能用工具真正做完的事就直接做完（写文件、跑脚本、建技能），不要只在回答里描述步骤。\n- 工具返回的结果就是事实，不要编造执行结果。\n- 回答用中文，简洁一点，可以用 Markdown 排版。\n- 报告 / 代码 / 表格这种长内容写成文件交给用户，而不是塞进回复。",
-]
+function withDefaults(cfg: AgentConfig): AgentConfig {
+  return syncActiveProvider(hydrateSecrets(withLegacyProvider(cfg)))
+}
 
-export function loadConfig(): AgentConfig {
-  try {
-    recoverAtomicFile(CONFIG_FILE)
-    const raw = FileManager.readAsStringSync(CONFIG_FILE)
-    const parsed = JSON.parse(raw)
-    const merged = { ...DEFAULT_CONFIG, ...parsed }
-    // 语义检索（向量服务）已下线：老配置里的这几个字段读到就丢弃，别把明文密钥继续留在盘上。
-    delete (merged as any).embedEnabled
-    delete (merged as any).embedBaseUrl
-    delete (merged as any).embedPath
-    delete (merged as any).embedApiKey
-    delete (merged as any).embedModel
-    if (
-      !merged.systemPrompt ||
-      LEGACY_DEFAULT_SYSTEM_PROMPTS.indexOf(merged.systemPrompt.trim()) >= 0
-    ) {
-      merged.systemPrompt = DEFAULT_SYSTEM_PROMPT
-    }
-    // 老配置没有 persona：补上默认性格；用户显式清空（""）则保持为空。
-    if (typeof merged.persona !== "string") merged.persona = DEFAULT_PERSONA
-    const hydrated = hydrateSecrets(syncActiveProvider(withLegacyProvider(merged)))
-    // 首次升级时读取旧明文（含已下线的向量服务 Key），再立即覆盖为脱敏版本。
-    const hasLegacySecrets =
-      !!(parsed.apiKey || parsed.embedApiKey || parsed.gitToken) ||
-      (parsed.providers ?? []).some((p: any) => !!p?.apiKey) ||
-      (parsed.mcpServers ?? []).some((s: any) => !!s?.token)
-    if (hasLegacySecrets) saveConfig(hydrated)
-    return syncActiveProvider(hydrated)
-  } catch {
-    return syncActiveProvider(hydrateSecrets(withLegacyProvider({ ...DEFAULT_CONFIG })))
-  }
+/** 出厂配置（还没有库 / 库还没水合时用）。 */
+function factoryConfig(): AgentConfig {
+  return withDefaults({ ...DEFAULT_CONFIG })
 }
 
 /**
- * 存盘：先把「当前使用」那家的字段同步到扁平字段再写，保证两边永远不会打架。
+ * 启动时把配置从库里装进内存，并就地升级老字段：
+ *   - 已下线的向量服务字段直接丢掉（别把明文密钥留在盘上）；
+ *   - 老的 systemPrompt 并进 persona（提示词只有「性格与角色」一处）。
  */
-export function saveConfig(cfg: AgentConfig): void {
+export async function hydrateConfig(): Promise<void> {
+  let parsed: any = null
+  try {
+    parsed = await kvJson<Record<string, any>>(KV_KEY)
+  } catch {
+    parsed = null
+  }
+  if (!parsed || typeof parsed !== "object") {
+    cache = factoryConfig()
+    return
+  }
+
+  const merged: any = { ...DEFAULT_CONFIG, ...parsed }
+  let changed = false
+  for (const key of ["embedEnabled", "embedBaseUrl", "embedPath", "embedApiKey", "embedModel"]) {
+    if (key in merged) {
+      delete merged[key]
+      changed = true
+    }
+  }
+  // 提示词只有「性格与角色」一处：老配置里的 systemPrompt 读出来就并过去，
+  // 用户没写过性格时把那段旧文本原样接过来当性格（内容不丢）。
+  const hadSystemPromptField = typeof merged.systemPrompt === "string"
+  const storedPrompt = hadSystemPromptField ? String(merged.systemPrompt).trim() : ""
+  if (typeof merged.persona !== "string") {
+    merged.persona = storedPrompt || DEFAULT_PERSONA
+    changed = true
+  }
+  if (hadSystemPromptField) {
+    delete merged.systemPrompt
+    changed = true
+  }
+  // 老配置 / 迁移过来的配置可能把明文密钥留在库里：读进 Keychain 后必须立刻写回脱敏版本。
+  const hasPlaintextSecrets =
+    !!merged.apiKey ||
+    !!merged.gitToken ||
+    (Array.isArray(merged.providers) && merged.providers.some((p: any) => !!p?.apiKey)) ||
+    (Array.isArray(merged.mcpServers) && merged.mcpServers.some((s: any) => !!s?.token))
+  if (hasPlaintextSecrets) changed = true
+
+  cache = withDefaults(merged)
+  // 升级过的老配置顺手写回去，库里就不再留着废弃字段。
+  if (changed) await saveConfig(cache)
+}
+
+/** 读配置（同步，走内存）。 */
+export function loadConfig(): AgentConfig {
+  if (!cache) cache = factoryConfig()
+  return cache
+}
+
+/** 存配置：先写 Keychain（同步），再落库。 */
+export async function saveConfig(cfg: AgentConfig): Promise<void> {
   const out = syncActiveProvider(cfg)
-  FileManager.createDirectorySync(AGENT_DIR, true)
-  writeJsonAtomically(CONFIG_FILE, redactSecrets(out))
+  cache = out
+  // 先通知（内存已经是新值），再等落库：界面不必等磁盘。
+  notifyConfigChanged()
+  await kvWriteJson(KV_KEY, redactSecrets(out))
 }
 
 /** 配置项的键名，供快捷指令传 JSON 时识别。 */
 export const CONFIG_KEYS: string[] = [
-  "apiKey", "baseUrl", "apiPath", "model", "systemPrompt",
+  "apiKey", "baseUrl", "apiPath", "model",
   "maxHistory", "maxToolRounds", "thinkingEnabled",
   "reasoningEffort", "tools", "mcpServers", "kbEnabled", "skillsEnabled",
   "showSteps", "imageEnabled", "imageMaxSize", "imageQuality", "agentName", "persona", "avatarPath", "gitToken", "modelOptions", "modelOptionsAt",
@@ -109,18 +162,20 @@ export const CONFIG_KEYS: string[] = [
 
 /**
  * 若 text 是一段包含配置键的 JSON 对象，则合并保存并返回 true。
- * 用于「快捷指令直接改配置」的兼容路径。
+ * 用于「快捷指令直接改配置」的兼容路径；调用方请 await（否则进程可能先退出）。
  */
-export function tryApplyConfigJson(text: string): boolean {
+export async function tryApplyConfigJson(text: string): Promise<boolean> {
   const t = (text ?? "").trim()
-  if (!t.startsWith("{")) return false
+  if (!t || t[0] !== "{") return false
+  let obj: any
   try {
-    const obj = JSON.parse(t)
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false
-    if (!Object.keys(obj).some((k) => CONFIG_KEYS.includes(k))) return false
-    saveConfig(mergeConfigPatch(loadConfig(), obj))
-    return true
+    obj = JSON.parse(t)
   } catch {
     return false
   }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false
+  const keys = Object.keys(obj)
+  if (keys.length === 0 || !keys.some((k) => CONFIG_KEYS.indexOf(k) >= 0)) return false
+  await saveConfig(mergeConfigPatch(loadConfig(), obj))
+  return true
 }

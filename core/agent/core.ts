@@ -449,9 +449,11 @@ function buildMessages(
 ): LLMMessage[] {
   const msgs: LLMMessage[] = []
   const sys: string[] = []
-  // 性格 / 角色排在系统提示词前面：先定“它是个什么样的人”，再说能力与规则。
+  // 名字单独说一句：性格里不写死名字，用户改了名字也不会和旧设定打架。
+  const agentName = (cfg.agentName ?? "").trim()
+  if (agentName) sys.push(`你的名字是「${agentName}」，用户这样称呼你。`)
+  // 「性格与角色」是唯一的人设来源：身份、说话方式、做事规则全在这一段里。
   if (cfg.persona && cfg.persona.trim()) sys.push(cfg.persona.trim())
-  if (cfg.systemPrompt) sys.push(cfg.systemPrompt)
   if (cfg.skillsEnabled) {
     const sp = skillsPrompt(cfg.onlySkillIds)
     if (sp) sys.push(sp)
@@ -572,7 +574,7 @@ function normalizeHooks(arg: HooksArg): RunAgentHooks {
   return arg
 }
 
-/** 存进历史前先截断，免得 sessions.json 被推理文本和长文档撑爆。 */
+/** 存进历史前先截断，免得会话数据被推理文本和长文档撑爆。 */
 const ARGS_CLIP = 300
 const RESULT_CLIP = 800
 const REASONING_CLIP = 1600

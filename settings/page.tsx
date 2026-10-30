@@ -3,7 +3,7 @@ import {
   Spacer, Text, TextField, Toggle, VStack, useEffect, useRef, useState,
 } from "scripting"
 import {
-  AgentConfig, DEFAULT_PERSONA, DEFAULT_SYSTEM_PROMPT, McpServer, ModelProvider, loadConfig, makeMcpServer, saveConfig,
+  AgentConfig, DEFAULT_PERSONA, McpServer, ModelProvider, loadConfig, makeMcpServer, saveConfig,
 } from "../core/agent/store"
 import { kbStats } from "../core/kb/store"
 import { ModelsPage, providerLabel, providerSubtitle, toProviders } from "./models"
@@ -17,7 +17,7 @@ import { McpPage } from "../capabilities/mcp"
 import { buildRoute, clearToRoot, popRoute, pushRoute, registerNavPath, registerRoute, activateNavPath } from "../app/nav_route"
 import { SettingsNavRow, SettingsSummaryRow } from "../ui/settings"
 import {
-  AVATAR_PATH, Avatar, chooseAvatarFromPhotos, commitAvatar,
+  AVATAR_PATH, Avatar, chooseAvatarFromPhotos, commitAvatar, resolveAvatarPath,
 } from "../ui/avatar"
 
 // ———————————————————————— 思考深度 ————————————————————————
@@ -32,16 +32,6 @@ const TIERS: { key: ThinkingTier; label: string; desc: string; cost: string }[] 
 ]
 
 
-/** 列表里显示性格摘要：取第一行有内容的文字，去掉 Markdown 记号。 */
-function personaSummary(text: string): string {
-  const line = (text || "")
-    .split("\n")
-    .map((s) => s.replace(/^[#>*\-+\s]+/, "").trim())
-    .find((s) => s.length > 0)
-  if (!line) return "还没有设定性格"
-  return line.length > 26 ? line.slice(0, 26) + "…" : line
-}
-
 /** 把配置里的 thinkingEnabled + reasoningEffort 反解成档位。 */
 function tierOf(cfg: AgentConfig): ThinkingTier {
   if (!cfg.thinkingEnabled) return "off"
@@ -54,14 +44,12 @@ export interface FormState {
   agentName: string
   /** 头像图片路径；空 = 显示占位图。选择照片时先指向暂存文件，保存时才转正。 */
   avatarPath: string
-  /** 助手的性格 / 角色（Markdown）；空 = 不加额外性格。 */
+  /** 助手的性格与角色（Markdown）——唯一的人设来源；空 = 不设人设。 */
   persona: string
   // 模型供应商：每家一套地址 / Key / 模型，聊天用 activeProviderId 那一家
   providers: ModelProvider[]
   activeProviderId: string
   // 对话
-  /** 智能体设定：发给模型的系统提示词。 */
-  systemPrompt: string
   /** 上下文聊天记录数量（以文本保存，空值在保存时兜底 50）。 */
   maxHistory: string
   /** 思考深度档位，保存时映射回 thinkingEnabled + reasoningEffort。 */
@@ -90,11 +78,11 @@ export interface FormState {
 function toFormState(cfg: AgentConfig): FormState {
   return {
     agentName: cfg.agentName,
-    avatarPath: cfg.avatarPath ?? "",
+    // 配置里可能是失效的旧绝对路径（容器 UUID 变了），这里统一换成实际能用的那个。
+    avatarPath: resolveAvatarPath(cfg.avatarPath),
     persona: cfg.persona ?? "",
     providers: (cfg.providers ?? []).map((p) => ({ ...p, modelOptions: (p.modelOptions ?? []).slice() })),
     activeProviderId: cfg.activeProviderId ?? "",
-    systemPrompt: cfg.systemPrompt,
     maxHistory: String(cfg.maxHistory),
     thinking: tierOf(cfg),
     showSteps: cfg.showSteps !== false,
@@ -189,7 +177,6 @@ export function ConfigPage({
   const stateRef = useRef(state)
   /** 知识库 / 技能子页改完数据回来后，用它强制本页重算统计数字。 */
   const [, setTick] = useState(0)
-  const [promptMode, setPromptMode] = useState<"edit" | "preview">("edit")
   const [personaMode, setPersonaMode] = useState<"edit" | "preview">("edit")
   const patch = (p: Partial<FormState>) => {
     const next = { ...stateRef.current, ...p }
@@ -281,7 +268,7 @@ export function ConfigPage({
           <SettingsNavRow
             icon={{ name: "brain.head.profile", color: "systemOrange" }}
             title="行为与思考"
-            detail="系统提示词与推理深度"
+            detail="思考多深、多久给答案"
             value={thinkingTier.label}
             onOpen={() => pushRoute("settings-agent")}
           />
@@ -375,7 +362,6 @@ export function ConfigPage({
       persona: next.persona.trim(),
       providers,
       activeProviderId: activeId,
-      systemPrompt: next.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT,
       maxHistory: Math.max(1, parseInt(next.maxHistory, 10) || 50),
       thinkingEnabled: next.thinking !== "off",
       reasoningEffort: next.thinking === "off" ? "" : next.thinking,
@@ -394,7 +380,7 @@ export function ConfigPage({
       toolCreateEnabled: next.toolCreateEnabled,
     }
 
-    saveConfig(cfg)
+    void saveConfig(cfg)
   }
 
   registerRoute("settings-profile", () => (
@@ -405,7 +391,7 @@ export function ConfigPage({
       <Form>
         <Section
           header={<Text>身份</Text>}
-          footer={<Text>名称和头像会显示在聊天页、会话列表以及助手回复旁。</Text>}
+          footer={<Text>名字会写进提示词，助手自我介绍就用它；头像显示在聊天页、会话列表和回复旁。</Text>}
         >
           <FieldRow label="助手名字">
             <TextField
@@ -435,33 +421,7 @@ export function ConfigPage({
           header={<Text>性格与角色</Text>}
           footer={
             <Text>
-              只写「它是个什么样的人」：性格、说话方式、习惯。这段会排在系统提示词最前面；能力和工具规则仍在「模型配置 → 行为与思考 → 系统提示词」里。
-            </Text>
-          }
-        >
-          <SettingsNavRow
-            icon={{ name: "theatermasks.fill", color: "systemPink" }}
-            title="性格与角色"
-            detail={personaSummary(state.persona)}
-            value="Markdown"
-            onOpen={() => pushRoute("settings-persona")}
-          />
-        </Section>
-      </Form>
-    </VStack>
-  ))
-
-  registerRoute("settings-persona", () => (
-    <VStack
-      navigationTitle="性格与角色"
-      navigationBarTitleDisplayMode="inline"
-    >
-      <Form>
-        <Section
-          header={<Text>它是谁、怎么说话</Text>}
-          footer={
-            <Text>
-              建议写 3~8 行：身份、语气、习惯、拿不准时怎么办。留空就只按系统提示词回答。
+              这段就是发给模型的全部设定：它是谁、怎么说话、怎么做事的规则都写在这里。改完下一轮生效，不用重开 App。清空后它就只剩技能清单和名字，没有任何人设约束。
             </Text>
           }
         >
@@ -479,7 +439,7 @@ export function ConfigPage({
               title="Markdown"
               value={state.persona}
               axis="vertical"
-              lineLimit={{ min: 10, max: 24, reservesSpace: true }}
+              lineLimit={{ min: 8, max: 20, reservesSpace: true }}
               onChanged={(v) => patch({ persona: v })}
             />
           ) : (
@@ -490,24 +450,19 @@ export function ConfigPage({
               scrollable={false}
             />
           )}
-        </Section>
-
-        <Section
-          header={<Text>想换个说法？</Text>}
-          footer={<Text>改完立刻生效，下一轮回复就按新性格来。</Text>}
-        >
           <Button
-            title="恢复默认性格"
+            title="恢复默认人设"
             systemImage="arrow.counterclockwise"
             action={() => patch({ persona: DEFAULT_PERSONA })}
           />
           <Button
-            title="清空（不加额外性格）"
+            title="清空（不设人设）"
             systemImage="trash"
             role="destructive"
             action={() => patch({ persona: "" })}
           />
         </Section>
+
       </Form>
     </VStack>
   ))
@@ -529,41 +484,6 @@ export function ConfigPage({
               <Text key={t.key} tag={t.key}>{t.label}</Text>
             ))}
           </Picker>
-        </Section>
-        <Section
-          header={<Text>系统提示词（能力与规则）</Text>}
-          footer={<Text>这里写能力、工具和回答规则；「它是个什么样的人」请到「角色与外观 → 性格与角色」里写。支持 Markdown。</Text>}
-        >
-          <Picker
-            title="显示模式"
-            pickerStyle="segmented"
-            value={promptMode}
-            onChanged={(v: string) => setPromptMode(v as "edit" | "preview")}
-          >
-            <Text tag="edit">编辑</Text>
-            <Text tag="preview">预览</Text>
-          </Picker>
-          {promptMode === "edit" ? (
-            <TextField
-              title="Markdown"
-              value={state.systemPrompt}
-              axis="vertical"
-              lineLimit={{ min: 10, max: 24, reservesSpace: true }}
-              onChanged={(v) => patch({ systemPrompt: v })}
-            />
-          ) : (
-            <Markdown
-              content={state.systemPrompt || "（暂无内容）"}
-              theme="github"
-              useDefaultHighlighterTheme
-              scrollable={false}
-            />
-          )}
-          <Button
-            title="恢复默认设定"
-            systemImage="arrow.counterclockwise"
-            action={() => patch({ systemPrompt: DEFAULT_SYSTEM_PROMPT })}
-          />
         </Section>
       </Form>
     </VStack>
@@ -742,7 +662,7 @@ export function ConfigPage({
             <SettingsNavRow
               icon={{ name: "person.crop.circle.fill", color: "systemPurple" }}
               title="角色与外观"
-              detail={`${state.avatarPath ? "自定义头像" : "默认头像"} · 性格${state.persona.trim() ? "已设定" : "未设定"}`}
+              detail={`${state.avatarPath ? "自定义头像" : "默认头像"} · 人设${state.persona.trim() ? "已设定" : "未设定"}`}
               value={state.agentName.trim() || "小助"}
               onOpen={() => pushRoute("settings-profile")}
             />

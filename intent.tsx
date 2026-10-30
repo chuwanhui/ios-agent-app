@@ -6,6 +6,7 @@ import { runAgent } from "./core/agent/core"
 import { capMessagesForSend, withStampedMessages } from "./core/agent/memory"
 import { drainNotifications } from "./core/notify/drain"
 import { enqueueNotify, queueSize } from "./core/notify/queue"
+import { initStorage } from "./core/db/init"
 
 type NotificationEnvelope = {
   app: string
@@ -74,10 +75,12 @@ async function handleNotification(envelope: NotificationEnvelope): Promise<void>
 
 async function run() {
   try {
+    // 快捷指令入口同样是独立进程，先把库里的数据读进内存。
+    await initStorage()
     const inputText = getInputText()
 
     // 兼容路径：输入是一段含配置键的 JSON 时，当作「改配置」而不是聊天。
-    if (inputText && tryApplyConfigJson(inputText)) {
+    if (inputText && (await tryApplyConfigJson(inputText))) {
       Script.exit(Intent.text("配置已更新"))
       return
     }
@@ -110,7 +113,7 @@ async function run() {
     )
 
     const capped = withStampedMessages(capMessagesForSend(newHistory, cfg.maxHistory))
-    saveStore(
+    await saveStore(
       upsertSession(history.store, {
         ...session,
         messages: capped,

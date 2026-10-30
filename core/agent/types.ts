@@ -96,7 +96,6 @@ export interface AgentConfig {
   providers?: ModelProvider[]
   /** 当前使用的供应商 id。 */
   activeProviderId?: string
-  systemPrompt: string
   maxHistory: number
   maxToolRounds: number
   thinkingEnabled: boolean
@@ -134,9 +133,11 @@ export interface AgentConfig {
   /** 用户上传的头像图片路径（图片存在 appGroup，这里只存路径）；为空就显示占位图。 */
   avatarPath?: string
   /**
-   * 助手的性格 / 角色设定（Markdown 纯文本）。
-   * 独立于「系统提示词」：它排在提示词最前面，只描述“它是个什么样的人”，
-   * 能力、工具规则这些仍然由 systemPrompt 负责。空字符串 = 不加额外性格。
+   * 助手的性格与角色（Markdown 纯文本）——**唯一**的人设 / 行为说明来源。
+   *
+   * 这里写什么，模型就当什么：身份、说话方式、做事规则都在这一段里。
+   * 代码里没有另外的「系统提示词」跟它拼在一起（只有助手名字和技能清单）。
+   * 空字符串 = 只靠技能清单与名字，等于没有任何人设约束。
    */
   persona: string
   /**
@@ -203,7 +204,7 @@ export interface ChatMessage {
   contextExcluded?: boolean
   /**
    * 附带的图片：存的是磁盘上的绝对路径（存在 agent/images/ 下），
-   * 发给模型时再读出来转成 data URL。不把 base64 塞 sessions.json，免得文件膨胀。
+   * 发给模型时再读出来转成 data URL。不把 base64 塞进会话数据，免得库膨胀。
    */
   images?: string[]
   /**

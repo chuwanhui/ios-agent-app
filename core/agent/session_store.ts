@@ -1,13 +1,27 @@
 /**
  * 会话存储：会话 CRUD、工作区目录、聊天图片的落盘与清理。
+ *
+ * 会话数据在 `agent.sqlite` 的 `sessions` 表里（一个会话一行，`data` 是整份会话 JSON）。
+ * 读走内存（启动时水合），写先改内存再落库，并且只写「真的变了」的那些行。
  */
 import { ChatMessage, Session, SessionStore } from "./types"
-import {
-  AGENT_DIR, IMAGES_DIR, LEGACY_HISTORY_FILE, NEW_SESSION_TITLE, SESSIONS_FILE, WORKSPACES_DIR,
-} from "./paths"
-import { recoverAtomicFile, writeJsonAtomically } from "./file_io"
+import { IMAGES_DIR, NEW_SESSION_TITLE, WORKSPACES_DIR } from "./paths"
+import { all, kvStep, kvText, tx } from "../db/db"
 
 // ———————————————————————— 会话 ————————————————————————
+
+/** 会话的内存副本（启动时由 hydrateSessions 填好）。 */
+let storeCache: SessionStore | null = null
+
+interface Persisted {
+  /** 上次落库时的会话对象引用：引用没变说明没人动过，连 stringify 都省了。 */
+  ref: Session
+  json: string
+  position: number
+}
+
+/** 已落库的快照，用来判断哪一行要写。 */
+let persisted = new Map<string, Persisted>()
 
 function newSessionId(): string {
   return "s" + Date.now().toString(36) + Math.floor(Math.random() * 1679616).toString(36)
@@ -36,6 +50,11 @@ function migratedWorkspaceName(session: Session): string {
   const legacyName = normalizeWorkspaceName(session?.id)
   const legacyPath = WORKSPACES_DIR + "/" + legacyName
   return FileManager.existsSync(legacyPath) ? legacyName : "default"
+}
+
+/** 老数据补齐工作区字段（迁移旧 JSON 时也走这里）。 */
+export function migrateSession(raw: Session): Session {
+  return { ...raw, workspaceName: migratedWorkspaceName(raw) }
 }
 
 export function makeSession(workspaceName = "default"): Session {
@@ -112,39 +131,93 @@ export function deriveTitle(messages: ChatMessage[]): string {
   return t.length > 18 ? t.slice(0, 18) + "…" : t
 }
 
-export function loadStore(): SessionStore {
-  try {
-    recoverAtomicFile(SESSIONS_FILE)
-    const parsed = JSON.parse(FileManager.readAsStringSync(SESSIONS_FILE))
-    if (parsed && Array.isArray(parsed.sessions)) {
-      const sessions: Session[] = parsed.sessions.map((session: Session) => ({
-        ...session,
-        workspaceName: migratedWorkspaceName(session),
-      }))
-      const hasCurrent = sessions.some((s) => s.id === parsed.currentId)
-      return { currentId: hasCurrent ? parsed.currentId : (sessions[0]?.id ?? null), sessions }
+// ———————————————————————— 读 / 写库 ————————————————————————
+
+/** 启动时把会话从库里装进内存（不含图片文件，图片仍然在 images/ 目录）。 */
+export async function hydrateSessions(): Promise<void> {
+  const rows = await all<{ id: string; position: number; data: string }>(
+    "SELECT id, position, data FROM sessions ORDER BY position ASC",
+  )
+  const sessions: Session[] = []
+  const next = new Map<string, Persisted>()
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.data) as Session
+      if (!parsed || !parsed.id) continue
+      const session = migrateSession(parsed)
+      if (!Array.isArray(session.messages)) session.messages = []
+      sessions.push(session)
+      next.set(session.id, { ref: session, json: row.data, position: Number(row.position) || 0 })
+    } catch {
+      // 坏行跳过：单个会话损坏不该让整个历史打不开
     }
-  } catch {
-    // 文件不存在或损坏，尝试下面迁移
   }
-  // 兼容旧版：把单会话 history.json 迁移成一个会话
+  persisted = next
+  let currentId: string | null = null
   try {
-    const legacy = JSON.parse(FileManager.readAsStringSync(LEGACY_HISTORY_FILE))
-    if (Array.isArray(legacy) && legacy.length > 0) {
-      const s = makeSession()
-      s.messages = legacy
-      s.title = deriveTitle(legacy)
-      return { currentId: s.id, sessions: [s] }
-    }
+    const raw = await kvText("sessions.current")
+    currentId = raw ? (JSON.parse(raw) as string | null) : null
   } catch {
-    // 没有旧数据
+    currentId = null
   }
-  return { currentId: null, sessions: [] }
+  if (!sessions.some((s) => s.id === currentId)) currentId = sessions[0]?.id ?? null
+  storeCache = { currentId, sessions }
 }
 
-export function saveStore(store: SessionStore): void {
-  FileManager.createDirectorySync(AGENT_DIR, true)
-  writeJsonAtomically(SESSIONS_FILE, store)
+/**
+ * 读会话（同步，走内存）。启动流程里 initStorage 已经把数据水合好了；
+ * 万一还没好（比如单元测试直接调），返回空store而不是崩。
+ */
+export function loadStore(): SessionStore {
+  return storeCache ?? { currentId: null, sessions: [] }
+}
+
+/** 存盘。返回 Promise 方便需要「确认写进去再退出」的地方 await（intent / 通知链路）。 */
+export function saveStore(store: SessionStore): Promise<void> {
+  storeCache = store
+  return persistStore(store).catch((e) => {
+    console.log("保存会话失败：" + (e?.message ?? String(e)))
+  })
+}
+
+/** 逐行比对，只写变过的会话、只删真没了的会话。 */
+async function persistStore(store: SessionStore): Promise<void> {
+  const steps: SQLite.TransactionStep[] = []
+  const alive = new Set<string>()
+
+  store.sessions.forEach((session, position) => {
+    alive.add(session.id)
+    const prev = persisted.get(session.id)
+    if (prev && prev.ref === session && prev.position === position) return
+    let json: string
+    try {
+      json = JSON.stringify(session)
+    } catch {
+      return
+    }
+    if (prev && prev.json === json && prev.position === position) {
+      persisted.set(session.id, { ref: session, json, position })
+      return
+    }
+    steps.push({
+      sql: `INSERT INTO sessions (id, position, updated_at, data) VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              position = excluded.position,
+              updated_at = excluded.updated_at,
+              data = excluded.data`,
+      args: [session.id, position, Number(session.updatedAt) || 0, json],
+    })
+    persisted.set(session.id, { ref: session, json, position })
+  })
+
+  for (const id of Array.from(persisted.keys())) {
+    if (alive.has(id)) continue
+    persisted.delete(id)
+    steps.push({ sql: "DELETE FROM sessions WHERE id = ?", args: [id] })
+  }
+
+  steps.push(kvStep("sessions.current", JSON.stringify(store.currentId ?? null)))
+  await tx(steps)
 }
 
 /** 保证 store 里有一个可用的当前会话（没有就新建一个并放到最前）。 */

@@ -9,12 +9,11 @@
  *
  * 这样 callback 不会被伪装成用户消息，OpenAI 兼容协议里的工具调用链也是完整的。
  */
-import {
-  AGENT_DIR, ChatMessage, Session, SessionStore, ToolStep,
-  loadStore, saveStore, upsertSession,
-} from "./store"
+import { ChatMessage, Session, SessionStore, ToolStep, loadStore, saveStore, upsertSession } from "./store"
+import { kvJson, kvWriteJson } from "../db/db"
 
-export const PENDING_FILE = AGENT_DIR + "/pending.json"
+/** 待回传记录在 kv 表里的键（默认 10 分钟有效，App 被杀掉也还在）。 */
+const PENDING_KEY = "tools.pending"
 
 /** 超过这么久还没回传，就当成「这个快捷指令其实没配回传」，把记录清掉。 */
 export const PENDING_TTL_MS = 10 * 60 * 1000
@@ -23,9 +22,8 @@ const MAX_PENDING = 20
 /** 记着最近处理过的回传，防止同一条 URL 被送达两次（冷启动 + resume）重复续跑。 */
 const MAX_DONE = 20
 
-/** 进程内缓存，防止极短间隔内两次 loadPending 读到旧状态。 */
-let pendingCache: { data: PendingFile; ts: number } | null = null
-const CACHE_TTL = 5000
+/** 内存副本（启动时由 hydratePending 填好），写入后立刻更新，读永远是最新的。 */
+let pendingCache: PendingFile | null = null
 /** 进程内去重锁：防止冷启动 + resume 双入口在极短窗口内重复处理同一条回传。 */
 const inFlight = new Set<string>()
 
@@ -47,52 +45,34 @@ interface PendingFile {
   done: { cid: string; at: number }[]
 }
 
-function readFile(): PendingFile {
-  const now = Date.now()
-  // 缓存命中：5 秒内的读请求直接返回缓存数据（避免并发读写竞态）
-  if (pendingCache && now - pendingCache.ts < CACHE_TTL) {
-    return { pending: [...pendingCache.data.pending], done: [...pendingCache.data.done] }
-  }
-  try {
-    const raw = JSON.parse(FileManager.readAsStringSync(PENDING_FILE))
-    const f: PendingFile = {
-      pending: Array.isArray(raw?.pending) ? raw.pending : [],
-      done: Array.isArray(raw?.done) ? raw.done : [],
-    }
-    pendingCache = { data: f, ts: now }
-    return f
-  } catch {
-    const f: PendingFile = { pending: [], done: [] }
-    pendingCache = { data: f, ts: now }
-    return f
+export async function hydratePending(): Promise<void> {
+  const parsed = await kvJson<Partial<PendingFile>>(PENDING_KEY)
+  pendingCache = {
+    pending: Array.isArray(parsed?.pending) ? (parsed!.pending as PendingCall[]) : [],
+    done: Array.isArray(parsed?.done) ? (parsed!.done as PendingFile["done"]) : [],
   }
 }
 
+function readFile(): PendingFile {
+  const f = pendingCache ?? { pending: [], done: [] }
+  return { pending: [...f.pending], done: [...f.done] }
+}
+
 function writeFile(f: PendingFile): void {
-  // 写入后立即刷新缓存（防止下次读到自己刚写的旧数据）
-  pendingCache = { data: f, ts: Date.now() }
-  try {
-    FileManager.createDirectorySync(AGENT_DIR, true)
-    FileManager.writeAsStringSync(
-      PENDING_FILE,
-      JSON.stringify({ pending: f.pending.slice(-MAX_PENDING), done: f.done.slice(-MAX_DONE) }, null, 2),
-    )
-  } catch {
-    // 写盘失败就当没有 pending：只是回填不上过程卡片，不影响触发本身
+  const next: PendingFile = {
+    pending: f.pending.slice(-MAX_PENDING),
+    done: f.done.slice(-MAX_DONE),
   }
+  pendingCache = next
+  void kvWriteJson(PENDING_KEY, next).catch((e) => {
+    // 落库失败就当没有 pending：只是回填不上过程卡片，不影响触发本身
+    console.log("保存回传待办失败：" + (e?.message ?? String(e)))
+  })
 }
 
 /** 丢掉过期记录（挂掉 / 没配回传的快捷指令留下的残渣）。 */
 export function prunePending(list: PendingCall[], now = Date.now()): PendingCall[] {
   return list.filter((p) => !!p && !!p.cid && now - (p.createdAt || 0) <= PENDING_TTL_MS).slice(-MAX_PENDING)
-}
-
-/** 现在还在等回传的调用（已经顺手清掉过期的）。 */
-export function loadPending(now = Date.now()): PendingCall[] {
-  const f = readFile()
-  const alive = prunePending(f.pending, now)
-  if (alive.length !== f.pending.length) writeFile({ pending: alive, done: f.done })
-  return alive
 }
 
 /** 记一次「已触发、等回传」。 */
@@ -280,7 +260,7 @@ export function handleCallback(params: any): CallbackOutcome | null {
       messages: msgs,
     }
     const next = upsertSession(store, updated)
-    saveStore(next)
+    void saveStore(next)
     if (matched) finishPending(matched.cid)
 
     return {

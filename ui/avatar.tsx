@@ -31,6 +31,19 @@ function fileExists(path?: string): boolean {
   }
 }
 
+/**
+ * 实际该显示哪个文件。
+ *
+ * 配置里存的是绝对路径，而 appGroup 容器的路径带 UUID —— 极少数情况下（重装、
+ * 从备份恢复、系统迁移容器）它会变，旧路径就不再存在，头像会「无声消失」。
+ * 所以配置路径失效时退回约定路径 `agent/avatar.png`：只要那张图还在就照常显示。
+ */
+export function resolveAvatarPath(path?: string): string {
+  if (fileExists(path)) return path as string
+  if (fileExists(AVATAR_PATH)) return AVATAR_PATH
+  return ""
+}
+
 // ———————————————————————— 落盘 ————————————————————————
 
 /**
@@ -123,7 +136,7 @@ export function Avatar({
   background = "secondarySystemFill",
   onTapGesture,
 }: Props) {
-  const path = fileExists(spec.path) ? (spec.path as string) : ""
+  const path = resolveAvatarPath(spec.path)
   if (path) {
     return (
       <Image

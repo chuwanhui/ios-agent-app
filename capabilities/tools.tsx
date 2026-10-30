@@ -271,12 +271,7 @@ function ToolListRow(props: { row: ToolRow; index: number; route: string; onDele
       status={props.row.returns ? "回传" : undefined}
       statusColor="systemGreen"
       onOpen={() => pushRoute(props.route)}
-      trailingSwipeActions={{
-        allowsFullSwipe: false,
-        actions: [
-          <Button title="删除" role="destructive" action={props.onDelete} />,
-        ],
-      }}
+      onDelete={props.onDelete}
     />
   )
 }

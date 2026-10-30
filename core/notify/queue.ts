@@ -1,4 +1,4 @@
-import { AGENT_DIR } from "../agent/store"
+import { acquireLock, kvJson, kvWriteJson, refreshLock, releaseLock } from "../db/db"
 
 export interface NotifyEnvelope {
   app: string
@@ -27,8 +27,9 @@ interface QueueFile {
   seen: SeenItem[]
 }
 
-const QUEUE_FILE = AGENT_DIR + "/notify_queue.json"
-const LOCK_FILE = AGENT_DIR + "/notify_queue.lock.json"
+/** 队列在 kv 表里的键。锁在 locks 表里（跨进程可见，所以不走内存）。 */
+const QUEUE_KEY = "notify.queue"
+const LOCK_NAME = "notify"
 const MAX_ITEMS = 300
 const MAX_SEEN = 1000
 const SEEN_TTL = 7 * 24 * 60 * 60 * 1000
@@ -54,25 +55,26 @@ export function dedupeKeyOf(input: NotifyEnvelope): string {
   return `raw:${normalize(input.app)}|${normalize(input.sender)}|${normalize(input.content)}`
 }
 
-function readQueue(): QueueFile {
-  try {
-    const raw = JSON.parse(FileManager.readAsStringSync(QUEUE_FILE))
-    return {
-      items: Array.isArray(raw?.items) ? raw.items : [],
-      seen: Array.isArray(raw?.seen) ? raw.seen : [],
-    }
-  } catch {
-    return { items: [], seen: [] }
+/** 队列的内存副本（启动时由 hydrateQueue 填好）。 */
+let queueCache: QueueFile | null = null
+
+export async function hydrateQueue(): Promise<void> {
+  const parsed = await kvJson<Partial<QueueFile>>(QUEUE_KEY)
+  queueCache = {
+    items: Array.isArray(parsed?.items) ? (parsed!.items as NotifyQueueItem[]) : [],
+    seen: Array.isArray(parsed?.seen) ? (parsed!.seen as SeenItem[]) : [],
   }
 }
 
+function readQueue(): QueueFile {
+  return queueCache ?? { items: [], seen: [] }
+}
+
 function writeQueue(file: QueueFile): void {
-  try {
-    FileManager.createDirectorySync(AGENT_DIR, true)
-    FileManager.writeAsStringSync(QUEUE_FILE, JSON.stringify(file, null, 2))
-  } catch {
-    // ignore
-  }
+  queueCache = file
+  void kvWriteJson(QUEUE_KEY, file).catch((e) => {
+    console.log("保存通知队列失败：" + (e?.message ?? String(e)))
+  })
 }
 
 function prune(file: QueueFile, now = Date.now()): QueueFile {
@@ -186,49 +188,27 @@ export function dropQueueItem(id: string): void {
   writeQueue(file)
 }
 
-export function acquireQueueLock(owner: string, ttlMs = LOCK_TTL): boolean {
-  const now = Date.now()
+/** 抢锁（跨进程）。抢不到返回 false，不抛错。 */
+export async function acquireQueueLock(owner: string, ttlMs = LOCK_TTL): Promise<boolean> {
   try {
-    const raw = JSON.parse(FileManager.readAsStringSync(LOCK_FILE))
-    const until = Number(raw?.until || 0)
-    const lockOwner = String(raw?.owner || "")
-    if (lockOwner && until > now && lockOwner !== owner) return false
-  } catch {
-    // no lock
-  }
-
-  try {
-    FileManager.createDirectorySync(AGENT_DIR, true)
-    FileManager.writeAsStringSync(
-      LOCK_FILE,
-      JSON.stringify({ owner, until: now + Math.max(5000, ttlMs), updatedAt: now }),
-    )
-    const check = JSON.parse(FileManager.readAsStringSync(LOCK_FILE))
-    return String(check?.owner || "") === owner
+    return await acquireLock(LOCK_NAME, owner, Math.max(5000, ttlMs))
   } catch {
     return false
   }
 }
 
-export function refreshQueueLock(owner: string, ttlMs = LOCK_TTL): void {
+/** 心跳续期：只有持锁人才能续。 */
+export async function refreshQueueLock(owner: string, ttlMs = LOCK_TTL): Promise<void> {
   try {
-    const raw = JSON.parse(FileManager.readAsStringSync(LOCK_FILE))
-    if (String(raw?.owner || "") !== owner) return
-    const now = Date.now()
-    FileManager.writeAsStringSync(
-      LOCK_FILE,
-      JSON.stringify({ owner, until: now + Math.max(5000, ttlMs), updatedAt: now }),
-    )
+    await refreshLock(LOCK_NAME, owner, Math.max(5000, ttlMs))
   } catch {
     // ignore
   }
 }
 
-export function releaseQueueLock(owner: string): void {
+export async function releaseQueueLock(owner: string): Promise<void> {
   try {
-    const raw = JSON.parse(FileManager.readAsStringSync(LOCK_FILE))
-    if (String(raw?.owner || "") !== owner) return
-    if (FileManager.existsSync(LOCK_FILE)) FileManager.removeSync(LOCK_FILE)
+    await releaseLock(LOCK_NAME, owner)
   } catch {
     // ignore
   }

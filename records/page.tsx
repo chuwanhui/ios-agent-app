@@ -1,9 +1,22 @@
-import { Button, Form, HStack, Menu, NavigationStack, Section, Spacer, Text, TextField, VStack, useState } from "scripting"
+import {
+  Button, DisclosureGroup, Form, HStack, Label, Markdown, Menu, NavigationStack, Section, Script, Spacer, Text,
+  TextField, VStack, useState,
+} from "scripting"
 import { MessageRecord, clearMessageRecords, loadMessageRecords } from "../core/records/store"
 import {
   NotifyQueueItem, dropQueueItem, failedQueueItems, queueSize, retryQueueItem,
 } from "../core/notify/queue"
 import { SettingsEmptyRow } from "../ui/settings"
+import { NOTIFY_TEMPLATE_JSON, notifyDocMarkdown } from "./notify_doc"
+
+/** 本脚本在「快捷指令」里的名字（说明文档里要写它）。 */
+function scriptName(): string {
+  try {
+    return (Script as any)?.name || "智能体"
+  } catch {
+    return "智能体"
+  }
+}
 
 function clip(s: string, max: number): string {
   if (s.length <= max) return s
@@ -134,6 +147,9 @@ export function RecordsPage() {
   const [pending, setPending] = useState(() => queueSize())
   const [query, setQuery] = useState("")
   const [appFilter, setAppFilter] = useState("")
+  /** 「怎么接微信 / 钉钉」那份说明默认收起，要看才展开。 */
+  const [docOpen, setDocOpen] = useState(false)
+  const [docNote, setDocNote] = useState("")
 
   function refresh() {
     setItems(loadMessageRecords())
@@ -150,6 +166,15 @@ export function RecordsPage() {
     if (!ok) return
     clearMessageRecords()
     refresh()
+  }
+
+  async function copyTemplate() {
+    try {
+      await Pasteboard.setString(NOTIFY_TEMPLATE_JSON)
+      setDocNote("已拷贝 JSON 模板，粘到快捷指令的「运行脚本」输入里就能用。")
+    } catch (e: any) {
+      setDocNote("写剪贴板失败：" + (e?.message ?? String(e)))
+    }
   }
 
   function handleRetry(id: string) {
@@ -249,6 +274,33 @@ export function RecordsPage() {
               </Section>
             ))
           )}
+          <Section
+            header={<Text>怎么接微信 / 钉钉</Text>}
+            footer={
+              <Text>
+                iOS 不允许脚本读别的 App 的通知，所以消息原文要由快捷指令交进来；这份说明里是完整的输入格式和配置步骤。
+              </Text>
+            }
+          >
+            <DisclosureGroup
+              isExpanded={docOpen}
+              onChanged={setDocOpen}
+              label={<Label title="通知协议与快捷指令配置" systemImage="text.book.closed.fill" />}
+            >
+              <Markdown
+                content={notifyDocMarkdown(scriptName())}
+                theme="github"
+                useDefaultHighlighterTheme
+                scrollable={false}
+              />
+              <Button title="拷贝 JSON 模板" systemImage="doc.on.clipboard" action={copyTemplate} />
+              {docNote ? (
+                <Text font="footnote" foregroundStyle="secondaryLabel">
+                  {docNote}
+                </Text>
+              ) : null}
+            </DisclosureGroup>
+          </Section>
         </Form>
       </VStack>
     </NavigationStack>
