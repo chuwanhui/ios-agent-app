@@ -3,6 +3,8 @@ import { CapabilitiesPage } from "./capabilities/page"
 import { ChatPage } from "./chat/page"
 import { ConfigPage } from "./settings/page"
 import { RecordsPage } from "./records/page"
+import { loadStore, pruneOrphanImages } from "./core/agent/store"
+import { drainNotifications } from "./core/notify/drain"
 import { openRootRoute, willSwitchTabOnRoot } from "./app/nav_route"
 
 function AgentApp() {
@@ -58,6 +60,21 @@ function AgentApp() {
 }
 
 async function run() {
+  // 启动清理：删会话 / 裁剪历史不会自动删聊天图片，这里扫一遍没人引用的文件。
+  try {
+    pruneOrphanImages(loadStore())
+  } catch {
+    // 清理失败不影响启动
+  }
+
+  // 打开就把积压的通知排空（以前只有「下一条通知到达」时才会顺带触发）。
+  // 不 await：界面先出来，队列在后台跑。
+  try {
+    void drainNotifications({ deadlineMs: 60_000 })
+  } catch {
+    // 排队失败不影响使用
+  }
+
   await Navigation.present({
     element: <AgentApp />,
     modalPresentationStyle: "fullScreen",

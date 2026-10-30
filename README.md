@@ -128,7 +128,8 @@
 │
 ├── chat/                    ① 聊天 tab
 │   ├── page.tsx             聊天页（气泡 / 工具栏 / 抽屉 / 发送与续跑）
-│   ├── input.tsx            底部输入栏（模型切换 / 图片草稿 / 发送）
+│   ├── use_agent_run.ts     一轮对话的运行时状态机（busy / 停止 / 实时打字区 / 增量合并刷新）
+│   ├── input.tsx            底部输入栏（模型切换 / 图片草稿 / 发送 / 停止）
 │   ├── sidebar.tsx          左侧抽屉（会话列表）
 │   ├── message.tsx          消息气泡 / 思考过程 / 产出文件卡片
 │   └── callback.ts          快捷指令回传的冷启动与续跑 hook
@@ -145,13 +146,31 @@
 │
 ├── settings/                ④ 设置 tab
 │   ├── page.tsx             角色与外观 / 模型配置 / 能力权限（唯一写 config.json 的地方）
-│   └── models.tsx           模型供应商（列表 + 详情：地址 / Key / 拉模型 / 查余额 / 设为当前 / 删除）
+│   ├── models.tsx           模型供应商（列表 + 详情：地址 / Key / 拉模型 / 查余额 / 设为当前 / 删除）
+│   └── diagnostics.tsx      诊断（最近每轮的耗时 / 轮次 / token / 错误）
 │
 ├── core/                    数据与能力（无 UI，可单独测试）
 │   ├── agent/
-│   │   ├── core.ts          DeepSeek 请求（流式 SSE + 工具循环）
-│   │   ├── store.ts         配置 + 会话存储
-│   │   ├── capabilities.ts  智能体「自己动手」的能力（文件 / 命令行 / 跑技能脚本 / 建技能 / 建工具）
+│   │   ├── core.ts          DeepSeek 请求（流式 SSE + 工具循环 + 重试 / 中途停止）
+│   │   ├── memory.ts        会话记忆（发前裁剪、条数超阈值压成摘要、30 天过期）
+│   │   ├── store.ts         上面这些存储模块的转发入口（import 照旧写这里就行）
+│   │   ├── types.ts         全部数据结构（AgentConfig / ChatMessage / Session …）
+│   │   ├── defaults.ts      出厂默认值（性格 / 系统提示词 / 默认配置）
+│   │   ├── paths.ts         落盘路径常量
+│   │   ├── file_io.ts       原子写 JSON / Keychain 存密钥
+│   │   ├── config_store.ts  配置读写与老配置迁移
+│   │   ├── session_store.ts 会话 CRUD / 工作区 / 聊天图片清理
+│   │   ├── provider.ts      模型供应商与扁平字段同步
+│   │   ├── mcp_json.ts      MCP 配置的导入 / 导出
+│   │   ├── tool_schema.ts   快捷指令工具的参数 schema 与函数名
+│   │   ├── capabilities.ts  能力总装（按开关挑出要挂的工具）
+│   │   ├── caps/            各项能力的具体实现
+│   │   │   ├── common.ts    路径越界防护 / 截断 / 尺寸格式化
+│   │   │   ├── types.ts     能力类型与参数整理
+│   │   │   ├── files.ts     列目录 / 读 / 写 / 删
+│   │   │   ├── cli.ts       命令行（白名单 + 危险写法拦截）
+│   │   │   ├── skills.ts    跑技能脚本 / 创建技能
+│   │   │   └── shortcut.ts  登记快捷指令工具
 │   │   └── tool_callback.ts 快捷指令回传（pending 落盘 + 回填步骤 + 续跑一轮）
 │   ├── kb/store.ts          知识库（bigram + BM25 本地检索）
 │   ├── skills/
@@ -159,7 +178,10 @@
 │   │   └── repo_import.ts   从 Git 仓库安装技能（下载 zip → 找 SKILL.md → 安装）
 │   ├── mcp/client.ts        MCP 客户端（JSON-RPC over Streamable HTTP）
 │   ├── models/balance.ts    查余额（按服务商的候选端点试，认不出的就说查不到）
-│   ├── notify/queue.ts      通知队列（去重 / 单消费者锁 / 失败退避重试）
+│   ├── notify/
+│   │   ├── queue.ts         通知队列（去重 / 单消费者锁心跳 / 失败退避与上限）
+│   │   └── drain.ts         队列消费（快捷指令与 App 启动共用，一条失败不拖垮整批）
+│   ├── diagnostics/store.ts 运行诊断（每轮耗时 / 轮次 / token / 错误，只留最近 120 条）
 │   └── records/store.ts     通知与回复的记录存储
 │
 └── ui/                      通用 UI 组件（纯展示，不碰数据）
@@ -194,8 +216,10 @@ scripting-ts preview_ui chat/page.tsx      # 预览 UI（任何页面都可以�
 | 聊天界面、输入栏、气泡 | `chat/` |
 | 记录页展示 | `records/` |
 | 知识库 / 技能 / 工具 / MCP 的管理界面 | `capabilities/` |
-| 设置项、模型供应商表单 | `settings/` |
+| 设置项、模型供应商表单、诊断页 | `settings/` |
 | 模型请求、会话与配置存储、知识库检索、技能注册表 | `core/` |
+| 「一轮对话怎么跑、怎么停、怎么打字」 | `chat/use_agent_run.ts` |
+| 「助手能动手做什么」（文件 / 命令行 / 技能 / 建工具） | `core/agent/caps/` |
 | 可复用的行 / 图标 / 头像 / 空状态 | `ui/` |
 ```
 
