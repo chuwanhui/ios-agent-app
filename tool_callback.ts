@@ -1,0 +1,297 @@
+/**
+ * 快捷指令回传的另一半。
+ *
+ * 触发一个带 `returns` 的快捷指令工具时，先落一条 pending 记录（写在磁盘上，
+ * App 被杀掉也还在，默认 10 分钟内有效）；快捷指令末尾「打开 URL」回调
+ * `scripting://run/<脚本名>?result=…` 时，我们做两件事：
+ *   1. 把结果回填到那条工具步骤（过程卡片上显示「已回传」+ 真实结果）；
+ *   2. 聊天页基于已回填的 step 还原 `role:"tool"`，让模型继续生成最终答复。
+ *
+ * 这样 callback 不会被伪装成用户消息，OpenAI 兼容协议里的工具调用链也是完整的。
+ */
+import {
+  AGENT_DIR, ChatMessage, Session, SessionStore, ToolStep,
+  loadStore, saveStore, upsertSession,
+} from "./agent_store"
+
+export const PENDING_FILE = AGENT_DIR + "/pending.json"
+
+/** 超过这么久还没回传，就当成「这个快捷指令其实没配回传」，把记录清掉。 */
+export const PENDING_TTL_MS = 10 * 60 * 1000
+
+const MAX_PENDING = 20
+/** 记着最近处理过的回传，防止同一条 URL 被送达两次（冷启动 + resume）重复续跑。 */
+const MAX_DONE = 20
+
+/** 进程内缓存，防止极短间隔内两次 loadPending 读到旧状态（竞态修复）。 */
+let pendingCache: { data: PendingFile; ts: number } | null = null
+const CACHE_TTL = 5000
+/** 进程内去重锁：防止冷启动 + resume 双入口在极短窗口内重复处理同一条回传。 */
+const inFlight = new Set<string>()
+
+/** 一次「已触发、等回传」的调用。 */
+export interface PendingCall {
+  /** 调用编号，回填步骤 / 去重都靠它。 */
+  cid: string
+  /** 模型看到的函数名。 */
+  toolName: string
+  /** 真实快捷指令名。 */
+  shortcutName: string
+  /** 传过去的参数 JSON（没有参数就是空串）。 */
+  args: string
+  createdAt: number
+}
+
+interface PendingFile {
+  pending: PendingCall[]
+  done: { cid: string; at: number }[]
+}
+
+function readFile(): PendingFile {
+  const now = Date.now()
+  // 缓存命中：5 秒内的读请求直接返回缓存数据（避免并发读写竞态）
+  if (pendingCache && now - pendingCache.ts < CACHE_TTL) {
+    return { pending: [...pendingCache.data.pending], done: [...pendingCache.data.done] }
+  }
+  try {
+    const raw = JSON.parse(FileManager.readAsStringSync(PENDING_FILE))
+    const f: PendingFile = {
+      pending: Array.isArray(raw?.pending) ? raw.pending : [],
+      done: Array.isArray(raw?.done) ? raw.done : [],
+    }
+    pendingCache = { data: f, ts: now }
+    return f
+  } catch {
+    const f: PendingFile = { pending: [], done: [] }
+    pendingCache = { data: f, ts: now }
+    return f
+  }
+}
+
+function writeFile(f: PendingFile): void {
+  // 写入后立即刷新缓存（防止下次读到自己刚写的旧数据）
+  pendingCache = { data: f, ts: Date.now() }
+  try {
+    FileManager.createDirectorySync(AGENT_DIR, true)
+    FileManager.writeAsStringSync(
+      PENDING_FILE,
+      JSON.stringify({ pending: f.pending.slice(-MAX_PENDING), done: f.done.slice(-MAX_DONE) }, null, 2),
+    )
+  } catch {
+    // 写盘失败就当没有 pending：只是回填不上过程卡片，不影响触发本身
+  }
+}
+
+/** 丢掉过期记录（挂掉 / 没配回传的快捷指令留下的残渣）。 */
+export function prunePending(list: PendingCall[], now = Date.now()): PendingCall[] {
+  return list.filter((p) => !!p && !!p.cid && now - (p.createdAt || 0) <= PENDING_TTL_MS).slice(-MAX_PENDING)
+}
+
+/** 现在还在等回传的调用（已经顺手清掉过期的）。 */
+export function loadPending(now = Date.now()): PendingCall[] {
+  const f = readFile()
+  const alive = prunePending(f.pending, now)
+  if (alive.length !== f.pending.length) writeFile({ pending: alive, done: f.done })
+  return alive
+}
+
+export function pendingCount(): number {
+  return loadPending().length
+}
+
+/** 记一次「已触发、等回传」。 */
+export function addPending(input: { cid: string; toolName: string; shortcutName: string; args?: string }): PendingCall {
+  const rec: PendingCall = {
+    cid: input.cid,
+    toolName: input.toolName || "",
+    shortcutName: input.shortcutName || "",
+    args: input.args ?? "",
+    createdAt: Date.now(),
+  }
+  const f = readFile()
+  writeFile({ pending: prunePending(f.pending).concat([rec]), done: f.done })
+  return rec
+}
+
+/** 一条回传处理完了：从 pending 里拿掉，并记进 done（用于去重）。 */
+export function finishPending(cid: string): void {
+  const f = readFile()
+  writeFile({
+    pending: f.pending.filter((p) => p.cid !== cid),
+    done: f.done.concat([{ cid, at: Date.now() }]),
+  })
+}
+
+// ———————————————————————— 回调 URL 上带回来的东西 ————————————————————————
+
+function pickText(params: any, keys: string[]): string {
+  if (!params || typeof params !== "object") return ""
+  for (let i = 0; i < keys.length; i++) {
+    const v = params[keys[i]]
+    if (typeof v === "string" && v.trim()) return v
+    if (typeof v === "number" || typeof v === "boolean") return String(v)
+    if (v && typeof v === "object") {
+      try {
+        return JSON.stringify(v)
+      } catch {
+        // 循环引用之类，忽略
+      }
+    }
+  }
+  return ""
+}
+
+/** 回调 URL 上带回来的结果文本；没有就返回空串。 */
+export function callbackResultOf(params: any): string {
+  return pickText(params, ["result", "text", "output", "结果", "回传", "内容"])
+}
+
+type ReplyEnvelope = {
+  callId: string
+  ok: boolean
+  output: string
+  error: string
+}
+
+function parseJsonObject(text: string): any | null {
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null
+  } catch {
+    try {
+      const value = JSON.parse(decodeURIComponent(text))
+      return value && typeof value === "object" && !Array.isArray(value) ? value : null
+    } catch {
+      return null
+    }
+  }
+}
+
+/** 新版回传协议：?reply={"v":1,"callId":"...","ok":true,"output":"..."} */
+export function parseReplyEnvelope(params: any): ReplyEnvelope | null {
+  if (!params || typeof params !== "object") return null
+  let payload: any = null
+  const raw = params.reply
+  if (raw && typeof raw === "object") payload = raw
+  if (typeof raw === "string" && raw.trim()) payload = parseJsonObject(raw)
+  if (!payload && ("callId" in params || "output" in params || "error" in params)) payload = params
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null
+
+  const output = pickText(payload, ["output", "result", "text", "内容"])
+  const error = pickText(payload, ["error", "message", "错误"])
+  if (!output && !error) return null
+  return {
+    callId: pickText(payload, ["callId", "cid", "id"]),
+    ok: !(payload.ok === false || String(payload.ok ?? "").toLowerCase() === "false"),
+    output,
+    error,
+  }
+}
+
+/** 一次回传的处理结果（聊天页拿它来续跑一轮）。 */
+export interface CallbackOutcome {
+  /** 落到哪个会话（已经写盘，并且把它设成了当前会话）。 */
+  sessionId: string
+}
+
+/** 在会话里找带这个 cid 的那一步。 */
+function findStep(
+  store: SessionStore,
+  cid: string,
+): { session: Session; msg: number; step: number } | null {
+  for (let si = 0; si < store.sessions.length; si++) {
+    const s = store.sessions[si]
+    const msgs = s.messages ?? []
+    for (let mi = 0; mi < msgs.length; mi++) {
+      const steps = msgs[mi].steps ?? []
+      for (let k = 0; k < steps.length; k++) {
+        if (steps[k].cid === cid) return { session: s, msg: mi, step: k }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * 处理一次回传。params 来自 `Script.queryParameters` 或 `Script.onResume` 的事件详情。
+ * 不是回传（没有 result）就返回 null。
+ */
+export function handleCallback(params: any): CallbackOutcome | null {
+  const reply = parseReplyEnvelope(params)
+  const result = reply
+    ? (reply.ok ? reply.output : `执行失败：${reply.error || reply.output || "未知错误"}`)
+    : callbackResultOf(params)
+  if (!result) return null
+
+  const now = Date.now()
+  const f = readFile()
+  const pending = prunePending(f.pending, now)
+  const wantedCid = reply?.callId || pickText(params, ["callId", "cid", "id"])
+  const hint = pickText(params, ["tool", "name", "shortcut", "工具", "快捷指令"])
+  // 回传必须带不可预测的 callId；不能按「最近一条」猜测，否则任意本机 URL
+  // 都能向正在等待的工具调用注入结果。
+  if (!wantedCid) return null
+  const lockKey = wantedCid
+  // 防止冷启动 + resume 在极短窗口内重复处理（第一次已加锁时第二次直接返回）
+  if (inFlight.has(lockKey)) return null
+  inFlight.add(lockKey)
+  try {
+    // 同一条回传送达两次（文件级 done 检查，第一次已被处理则忽略）
+    if (wantedCid && f.done.some((d) => d.cid === wantedCid)) return null
+
+    let idx = -1
+    if (wantedCid) {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (pending[i].cid === wantedCid) { idx = i; break }
+      }
+    }
+    if (idx < 0 && hint) {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        const p = pending[i]
+        if (p.shortcutName === hint || p.toolName === hint) { idx = i; break }
+      }
+    }
+    const matched: PendingCall | null = idx >= 0 ? pending[idx] : null
+
+    const store = loadStore()
+    const hit = matched ? findStep(store, matched.cid) : null
+    if (!matched || !hit) {
+      return null
+    }
+
+    let session: Session | null = null
+    for (let i = 0; i < store.sessions.length; i++) {
+      if (store.sessions[i].id === hit.session.id) session = store.sessions[i]
+    }
+    if (!session) {
+      return null
+    }
+
+    // ① 回填过程卡片上的那一步（结果被真实回传覆盖，标上「已回传」）
+    const msgs: ChatMessage[] = (session.messages ?? []).slice()
+    if (hit && msgs[hit.msg] && msgs[hit.msg].steps) {
+      const m: ChatMessage = { ...msgs[hit.msg] }
+      const steps: ToolStep[] = (m.steps ?? []).slice()
+      steps[hit.step] = { ...steps[hit.step], result, ok: reply ? reply.ok : true, pending: false, callback: true }
+      m.steps = steps
+      msgs[hit.msg] = m
+    }
+
+    // ② 回传本身不新增用户消息。下一次请求会从这条 step 还原出 role:"tool"。
+    const updated: Session = {
+      ...session,
+      updatedAt: now,
+      messages: msgs,
+    }
+    const next = upsertSession(store, updated)
+    saveStore(next)
+    if (matched) finishPending(matched.cid)
+
+    return {
+      sessionId: updated.id,
+    }
+  } finally {
+    // 确保无论正常返回还是异常都释放锁
+    inFlight.delete(lockKey)
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "description" : "聊天式手机智能体：DeepSeek 大模型 + 快捷指令 \/ MCP \/ 知识库工具调用",
+  "icon" : "sparkles",
+  "iconImage" : "",
+  "remoteResource" : {
+    "autoUpdateInterval" : 300,
+    "hash" : "cf06656f67e96bb3b040231e1f961cb3",
+    "url" : "https:\/\/github.com\/chuwanhui\/ios-agent.git"
+  },
+  "runInApp" : false,
+  "entry" : "index.tsx",
+  "intentInputTypes" : [
+    "texts",
+    "urls"
+  ],
+  "contributors" : [
+
+  ],
+  "permissions" : null,
+  "name" : "智能体",
+  "color" : "#5856D6",
+  "version" : "1.0.0",
+  "localizedNames" : {
+    "es" : "",
+    "zh" : "",
+    "it" : "",
+    "ru" : "",
+    "ja" : "",
+    "en" : "",
+    "fr" : "",
+    "de" : "",
+    "pt" : ""
+  },
+  "author" : null,
+  "localizedDescriptions" : {
+    "ja" : "",
+    "de" : "",
+    "it" : "",
+    "es" : "",
+    "en" : "",
+    "pt" : "",
+    "zh" : "",
+    "ru" : "",
+    "fr" : ""
+  }
+}
