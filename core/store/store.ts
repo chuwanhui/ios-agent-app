@@ -47,6 +47,19 @@ export function kvJson<T = any>(key: string): T | null {
   return readJsonFile<T>(kvFile(key))
 }
 
+/**
+ * 最近一次落盘失败。
+ *
+ * 为什么要记：写盘抛错原来只 console.log，用户完全看不见 —— 于是出现最难查的一类毛病：
+ * 设置页改完了、聊天也能用（内存是对的），可快捷指令 / URL 冷启动是新进程、只读磁盘，
+ * 那份还是旧的，于是一条入口正常、另一条报「余额不足」之类莫名其妙的错。
+ */
+let lastWriteError: { key: string; at: number; detail: string } | null = null
+
+export function storageWriteError(): { key: string; at: number; detail: string } | null {
+  return lastWriteError
+}
+
 export function kvWrite(key: string, value: string): void {
   ensureDir(KV_DIR)
   try {
@@ -54,8 +67,18 @@ export function kvWrite(key: string, value: string): void {
     const tmp = path + ".tmp"
     FileManager.writeAsStringSync(tmp, value)
     FileManager.renameSync(tmp, path)
+    // 写完读回来对一遍：磁盘满 / 只读挂载这类问题，写入 API 不一定抛错。
+    const back = readTextFile(path)
+    if (back !== value) {
+      lastWriteError = { key, at: Date.now(), detail: "写完读回来不一致（可能是空间不足）" }
+      console.log(`保存 ${key} 后校验不一致`)
+      return
+    }
+    lastWriteError = null
   } catch (e: any) {
-    console.log(`保存 ${key} 失败：` + (e?.message ?? String(e)))
+    const detail = e?.message ?? String(e)
+    lastWriteError = { key, at: Date.now(), detail }
+    console.log(`保存 ${key} 失败：` + detail)
   }
 }
 

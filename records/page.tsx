@@ -1,6 +1,6 @@
 import {
-  Button, DisclosureGroup, Form, HStack, Label, Markdown, Menu, NavigationStack, Section, Script, Spacer, Text,
-  TextField, VStack, useState,
+  Button, DisclosureGroup, EmptyView, Form, HStack, Image, Label, Markdown, Menu, NavigationStack, Section,
+  Script, Spacer, Text, TextField, VStack, useEffect, useRef, useState,
 } from "scripting"
 import { MessageRecord, clearMessageRecords, loadMessageRecords } from "../core/records/store"
 import {
@@ -8,6 +8,11 @@ import {
 } from "../core/notify/queue"
 import { SettingsEmptyRow } from "../ui/settings"
 import { NOTIFY_TEMPLATE_JSON, notifyDocMarkdown, urlEntryDoc } from "./notify_doc"
+import { SenderThreadPage } from "./thread"
+import { activateNavPath, buildRoute, clearToRoot, pushRoute, registerNavPath, registerRoute } from "../app/nav_route"
+
+/** 本页在导航总线里的 key（和能力页、设置页分开，互不覆盖）。 */
+const NAV_KEY = "records"
 
 /** 本脚本在「快捷指令」里的名字（说明文档里要写它）。 */
 function scriptName(): string {
@@ -97,14 +102,16 @@ function matches(item: MessageRecord, query: string, app: string): boolean {
   return hay.indexOf(q) >= 0
 }
 
-function SenderRow({ item }: { item: SenderGroup }) {
+/** 一行发件人摘要；点整行进去看和 TA 的全部往来。 */
+function SenderRow({ item, onOpen }: { item: SenderGroup; onOpen: () => void }) {
   return (
-    <VStack spacing={6} padding={{ vertical: 6 }}>
+    <VStack spacing={6} padding={{ vertical: 6 }} contentShape="rect" onTapGesture={onOpen}>
       <HStack spacing={8} frame={{ maxWidth: "infinity" }}>
         <Text fontWeight="semibold">{item.sender}</Text>
         <Text font="footnote" foregroundStyle="secondaryLabel">{item.count} 条</Text>
         <Spacer />
         <Text font="footnote" foregroundStyle="secondaryLabel">{formatTime(item.lastAt)}</Text>
+        <Image systemName="chevron.right" font="caption2" foregroundStyle="tertiaryLabel" />
       </HStack>
 
       <Text font="footnote" foregroundStyle="secondaryLabel">最近收到：{clip(item.last?.content || "", 160) || "（空）"}</Text>
@@ -141,7 +148,14 @@ function FailedRow({
   )
 }
 
-export function RecordsPage() {
+export function RecordsPage({
+  active = true, onOpenChat,
+}: {
+  /** 这一页是不是当前标签（导航总线只认「可见的那一页」）。 */
+  active?: boolean
+  /** 跳到「聊天」标签里的某条会话。 */
+  onOpenChat?: (sessionId: string) => void
+}) {
   const [items, setItems] = useState<MessageRecord[]>(() => loadMessageRecords())
   const [failed, setFailed] = useState<NotifyQueueItem[]>(() => failedQueueItems())
   const [pending, setPending] = useState(() => queueSize())
@@ -151,6 +165,45 @@ export function RecordsPage() {
   const [docOpen, setDocOpen] = useState(false)
   const [docNote, setDocNote] = useState("")
   const [runDocOpen, setRunDocOpen] = useState(false)
+  /** 导航栈的 path：进发件人详情时往里推一层。 */
+  const [navPath, setNavPath] = useState<string[]>([])
+  const pathRef = useRef<string[]>(navPath)
+  pathRef.current = navPath
+
+  // 本页在标签栏里常驻，只有可见时才接管导航总线，否则会抢走设置页 / 能力页的 path。
+  useEffect(() => {
+    if (!active) {
+      registerNavPath(NAV_KEY, null)
+      return
+    }
+    registerNavPath(NAV_KEY, {
+      get: () => pathRef.current,
+      set: (v) => setNavPath((prev) => (typeof v === "function" ? (v as (p: string[]) => string[])(prev) : v)),
+    })
+    activateNavPath(NAV_KEY)
+    return () => registerNavPath(NAV_KEY, null)
+  }, [active])
+
+  /** 发件人详情：路由 id 里带上「App | 发件人」，两段各自编码，免得有 `|` 或 `/` 打架。 */
+  registerRoute("sender:", (rest) => {
+    const [rawApp, rawSender] = rest.split("|")
+    const app = decodeURIComponent(rawApp ?? "")
+    const sender = decodeURIComponent(rawSender ?? "")
+    if (!app && !sender) return null
+    return (
+      <SenderThreadPage
+        app={app}
+        sender={sender}
+        items={loadMessageRecords().filter((it) => (it.app || "（未知 App）") === app && (it.sender || "（未知发件人）") === sender)}
+        onOpenChat={
+          // 跳去聊天前把本页退回根：不然下次切回「记录」还停在这个发件人详情上。
+          onOpenChat ? (id) => { clearToRoot(); onOpenChat(id) } : undefined
+        }
+      />
+    )
+  })
+
+  const firstRoute = navPath[0] ?? ""
 
   function refresh() {
     setItems(loadMessageRecords())
@@ -209,6 +262,17 @@ export function RecordsPage() {
         navigationTitle="消息记录"
         navigationBarTitleDisplayMode="large"
         onAppear={refresh}
+        navigationDestination={{
+          isPresented: firstRoute !== "",
+          onChanged: (presented) => {
+            if (!presented) clearToRoot()
+          },
+          content: (
+            <VStack key={"lvl1:" + firstRoute} frame={{ maxWidth: "infinity", maxHeight: "infinity" }}>
+              {firstRoute ? buildRoute(firstRoute) ?? <EmptyView /> : <EmptyView />}
+            </VStack>
+          ),
+        }}
       >
         <Form>
           <Section title="概览">
@@ -306,10 +370,16 @@ export function RecordsPage() {
               <Section
                 key={appGroup.app}
                 header={<Text>{`${appGroup.app} · ${appGroup.count} 条`}</Text>}
-                footer={<Text>最近：{formatTime(appGroup.lastAt)}</Text>}
+                footer={<Text>{`最近：${formatTime(appGroup.lastAt)} · 点一个发件人看 TA 的全部往来`}</Text>}
               >
                 {appGroup.senders.map((sender) => (
-                  <SenderRow key={`${appGroup.app}:${sender.sender}`} item={sender} />
+                  <SenderRow
+                    key={`${appGroup.app}:${sender.sender}`}
+                    item={sender}
+                    onOpen={() => pushRoute(
+                      "sender:" + encodeURIComponent(appGroup.app) + "|" + encodeURIComponent(sender.sender),
+                    )}
+                  />
                 ))}
               </Section>
             ))

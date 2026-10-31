@@ -11,10 +11,12 @@ import {
   TextField,
   VStack,
   useEffect,
+  useRef,
   useState,
 } from "scripting"
 import { ModelProvider, makeProvider, suggestProviderName } from "../core/agent/store"
 import { queryBalance } from "../core/models/balance"
+import { httpErrorText } from "../core/agent/http_error"
 import { FieldRow } from "../ui/forms"
 import { popRoute, pushRoute, registerRoute } from "../app/nav_route"
 import { SettingsEmptyRow, SettingsListRow, SettingsSummaryRow } from "../ui/settings"
@@ -136,10 +138,8 @@ export async function fetchModelList(
     }
     if (!resp.ok) {
       const text = await resp.text()
-      return {
-        list: [],
-        error: `拉取失败（${resp.status}）：${oneLine(text).slice(0, 200) || "服务端没返回可用模型列表"}`,
-      }
+      // 和聊天时那条错误用同一套翻译：402 就是「余额不足」这种人话。
+      return { list: [], error: "拉取失败：" + httpErrorText(resp.status, text) }
     }
     const data: any = await resp.json()
     const raw: any[] = Array.isArray(data?.data)
@@ -218,26 +218,39 @@ export function ModelsPage({ rows, activeId, onChange, onActiveChange }: Props) 
   const [query, setQuery] = useState("")
   /** 打开这一页时自动拉取的状态行。 */
   const [note, setNote] = useState("")
+  // 异步「拉模型 / 查余额」完成时，不能再拿发请求那刻的 draft 闭包写回。
+  // 否则用户刚删掉 A，A 的旧请求回来后会把「删之前整张列表」重存，A 就复活了。
+  const draftRef = useRef<ModelProvider[]>(draft)
+  draftRef.current = draft
 
   function push(next: ModelProvider[]) {
+    draftRef.current = next
     setDraft(next)
     onChange(next)
   }
 
-  function update(i: number, p: Partial<ModelProvider>) {
-    push(draft.map((r, idx) => (idx === i ? { ...r, ...p } : r)))
+  /**
+   * 按稳定 id 改一条；目标已经删掉就什么都不做。
+   * 绝不能按 index：删除后下标会移动，旧请求回来可能误改另一家。
+   */
+  function update(id: string, p: Partial<ModelProvider>) {
+    const current = draftRef.current
+    if (!current.some((r) => r.id === id)) return
+    push(current.map((r) => (r.id === id ? { ...r, ...p } : r)))
   }
 
   function add() {
-    push([...draft, makeProvider()])
+    push([...draftRef.current, makeProvider()])
   }
 
-  function remove(i: number) {
-    const target = draft[i]
-    const next = draft.filter((_, idx) => idx !== i)
+  function remove(id: string) {
+    const current = draftRef.current
+    const target = current.find((r) => r.id === id)
+    if (!target) return
+    const next = current.filter((r) => r.id !== id)
     push(next)
     // 删除当前供应商时，自动切到剩余的第一家；没有可用项则清空当前 id。
-    if (target?.id === activeId) onActiveChange(next[0]?.id ?? "")
+    if (target.id === activeId) onActiveChange(next[0]?.id ?? "")
   }
 
   // 打开这一页 → 给「当前使用」那家静默拉一次模型 + 余额（失败只在下面写一行，不弹窗）
@@ -267,7 +280,8 @@ export function ModelsPage({ rows, activeId, onChange, onActiveChange }: Props) 
         patches.balanceSource = bal.source
         patches.balanceAt = Date.now()
       }
-      push(draft.map((x, idx) => (idx === i ? { ...x, ...patches } : x)))
+      // 请求期间用户可能删掉/改过这家：按 id 更新「当前」列表，不能用旧 draft 整体写回。
+      update(r.id, patches)
       setNote("")
     })()
   }, [])
@@ -285,8 +299,8 @@ export function ModelsPage({ rows, activeId, onChange, onActiveChange }: Props) 
         initial={r}
         active={r.id === activeId}
         onActivate={() => onActiveChange(r.id)}
-        onChange={(q) => update(i, q)}
-        onDelete={() => remove(i)}
+        onChange={(q) => update(r.id, q)}
+        onDelete={() => remove(r.id)}
       />
     )
   })
@@ -324,7 +338,7 @@ export function ModelsPage({ rows, activeId, onChange, onActiveChange }: Props) 
                 row={p}
                 active={p.id === activeId}
                 route={"provider:" + p.id}
-                onDelete={() => remove(i)}
+                onDelete={() => remove(p.id)}
               />
             ))
           )}

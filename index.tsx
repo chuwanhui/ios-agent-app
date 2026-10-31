@@ -1,7 +1,7 @@
-import { Label, Navigation, Script, TabView, VStack, useState } from "scripting"
+import { Label, Navigation, Script, TabView, VStack, useEffect, useState } from "scripting"
 import { CapabilitiesPage } from "./capabilities/page"
 import { ChatPage } from "./chat/page"
-import { ChatSeed, messageParam, seedFromMessage } from "./core/agent/url_entry"
+import { ChatSeed, messageFrom, messageParam, seedFromMessage } from "./core/agent/url_entry"
 import { ConfigPage } from "./settings/page"
 import { RecordsPage } from "./records/page"
 import { loadStore, pruneOrphanImages } from "./core/agent/store"
@@ -11,15 +11,40 @@ import { initStorage } from "./core/store/init"
 
 function AgentApp({ initialSeed = null }: { initialSeed?: ChatSeed | null }) {
   const [tabIndex, setTabIndex] = useState(0)
-  /** 第一次进聊天页时要处理的那条（见下面 run() 里的 URL 入口）。 */
+  /** 交给聊天页执行的一条入口动作（URL 入口 / 从记录页点进来）。 */
   const [seed, setSeed] = useState<ChatSeed | null>(initialSeed)
 
-  // 只处理一次：取走就清空，否则切换标签回来会重发。
-  function consumeSeed(): ChatSeed | null {
-    const value = seed
-    if (value) setSeed(null)
-    return value
+  /** 从「记录」页点进某个发件人后，跳回聊天标签并落到 TA 的那条会话。 */
+  function openChatSession(sessionId: string) {
+    setTabIndex(0)
+    setSeed({ sessionId, text: "" })
   }
+
+  /**
+   * Scripting 已经开着时，`scripting://run/智能体?message=…` 是一次「唤起」，不是冷启动。
+   * 入口必须在 App 壳层接：先把用户带回「聊天」标签，再解析通知并切到对应会话。
+   *
+   * 以前在 ChatPage 内接也能处理消息，但若用户当时停在「记录」或「设置」，底部标签不切，
+   * 看起来就像「打开了 Scripting，却没展示聊天」。回传 URL 没有 message，不会进这条。
+   */
+  useEffect(() => {
+    const off = Script.onResume((event: any) => {
+      const text = messageFrom(event?.queryParameters ?? null)
+      if (!text.trim()) return
+      setTabIndex(0)
+      void (async () => {
+        try {
+          const incoming = await seedFromMessage(text)
+          if (incoming) setSeed(incoming)
+        } catch (e: any) {
+          console.log("处理 URL 唤起消息失败：" + (e?.message ?? String(e)))
+        }
+      })()
+    })
+    return () => {
+      if (typeof off === "function") off()
+    }
+  }, [])
 
   function openSettings(route = "") {
     willSwitchTabOnRoot(null) // 清除能力标签的回调
@@ -43,14 +68,19 @@ function AgentApp({ initialSeed = null }: { initialSeed?: ChatSeed | null }) {
         tabItem={<Label title="聊天" systemImage="bubble.left.and.bubble.right.fill" />}
         frame={{ maxWidth: "infinity", maxHeight: "infinity" }}
       >
-        <ChatPage embedded onOpenSettings={openSettings} takeSeed={consumeSeed} />
+        <ChatPage
+          embedded
+          onOpenSettings={openSettings}
+          seed={seed}
+          onSeedConsumed={() => setSeed(null)}
+        />
       </VStack>
       <VStack
         tag={1}
         tabItem={<Label title="记录" systemImage="clock.arrow.circlepath" />}
         frame={{ maxWidth: "infinity", maxHeight: "infinity" }}
       >
-        <RecordsPage />
+        <RecordsPage active={tabIndex === 1} onOpenChat={openChatSession} />
       </VStack>
       <VStack
         tag={2}

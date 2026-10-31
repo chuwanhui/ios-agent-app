@@ -31,6 +31,9 @@ export interface RunLogEntry {
   cachedInputTokens?: number
   /** 用的哪个模型（换模型后对比耗时用）。 */
   model?: string
+  /** 用的哪家供应商 / 哪个接口地址 —— 两条入口（聊天 / URL）结果不一致时，先看这两项。 */
+  provider?: string
+  host?: string
   /** 出错时的第一行摘要。 */
   error?: string
 }

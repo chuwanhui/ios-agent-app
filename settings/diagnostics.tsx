@@ -2,7 +2,9 @@ import { Button, Form, HStack, ProgressView, Section, Spacer, Text, VStack, useE
 import {
   RunLogEntry, RunSource, clearRunLog, loadRunLog, runLogStats,
 } from "../core/diagnostics/store"
-import { compactStore, dataPath, storeStats } from "../core/store/store"
+import { compactStore, dataPath, kvJson, storageWriteError, storeStats } from "../core/store/store"
+import { activeProvider, loadConfig } from "../core/agent/store"
+import { keyFingerprint } from "../core/agent/http_error"
 import { bootTimings, storageDegraded } from "../core/store/init"
 import { SettingsEmptyRow, SettingsSummaryRow } from "../ui/settings"
 
@@ -62,6 +64,8 @@ function RunRow({ entry }: { entry: RunLogEntry }) {
   const cached = entry.cachedInputTokens ?? 0
   const toolText = entry.tools > 0 ? `工具 ${entry.tools} 次${entry.failedTools > 0 ? `（失败 ${entry.failedTools}）` : ""}` : "没调工具"
   const detail = [
+    // 供应商 + 主机名放在最前面：两条入口（聊天 / URL）结果不一样时，先看这两项是不是同一家。
+    entry.provider || entry.host ? `${entry.provider || "未命名供应商"}${entry.host ? " · " + entry.host : ""}` : "",
     entry.model || "未知模型",
     `${entry.rounds} 轮对话`,
     toolText,
@@ -225,6 +229,15 @@ export function DiagnosticsPage() {
                 本次写不进数据目录，改动只在内存里，退出后就没了。检查一下手机存储空间。
               </Text>
             ) : null}
+            {(() => {
+              const bad = storageWriteError()
+              if (!bad) return null
+              return (
+                <Text font="caption2" foregroundStyle="systemRed">
+                  {`最近一次保存失败：${bad.key}（${bad.detail}）。这一改只留在内存里，快捷指令读到的还是旧配置。`}
+                </Text>
+              )
+            })()}
             {storage ? (
               <Text font="caption2" foregroundStyle="tertiaryLabel">
                 {`${fmtBytes(storage.bytes)} · 会话 ${storage.sessions} 个 · 通知记录 ${storage.records} 条 · 诊断 ${storage.runs} 条${storage.tempFiles > 0 ? ` · 残留 ${storage.tempFiles} 个` : ""}`}
@@ -238,6 +251,63 @@ export function DiagnosticsPage() {
             systemImage="arrow.triangle.2.circlepath"
             action={compact}
           />
+        </Section>
+
+        <Section
+          header={<Text>现在用的是哪家</Text>}
+          footer={
+            <Text>
+              这里读的就是当前生效的配置。聊天页顶上显示的模型应该和这里一致；如果两条入口（聊天 / 快捷指令）报的错不一样，先对一下这一块和「运行记录」里的供应商。
+            </Text>
+          }
+        >
+          {(() => {
+            const cfg = loadConfig()
+            const p = activeProvider(cfg)
+            const rows: Array<[string, string]> = [
+              ["供应商", (p?.name ?? "").trim() || "（一家都没有）"],
+              ["接口地址", (cfg.baseUrl ?? "").trim() || "（空）"],
+              ["模型", (cfg.model ?? "").trim() || "（空）"],
+              ["API Key", keyFingerprint(cfg.apiKey)],
+            ]
+            // 内存 vs 磁盘：设置页能改、聊天页能聊，但另一条入口（快捷指令 / URL 冷启动）
+            // 是新进程、只读磁盘上的那份。两边一旦不一致，就会出现「这里能用、那里报错」。
+            const disk = (() => {
+              try {
+                return kvJson<any>("config")
+              } catch {
+                return null
+              }
+            })()
+            const same =
+              !!disk &&
+              String(disk.activeProviderId ?? "") === String(cfg.activeProviderId ?? "") &&
+              String(disk.baseUrl ?? "") === String(cfg.baseUrl ?? "") &&
+              String(disk.model ?? "") === String(cfg.model ?? "")
+            return (
+              <VStack spacing={4} padding={{ vertical: 4 }} frame={{ maxWidth: "infinity" }}>
+                {rows.map(([label, value]) => (
+                  <HStack key={label} spacing={8} frame={{ maxWidth: "infinity" }}>
+                    <Text font="footnote">{label}</Text>
+                    <Spacer />
+                    <Text font="footnote" foregroundStyle="secondaryLabel" lineLimit={1}>{value}</Text>
+                  </HStack>
+                ))}
+                <HStack spacing={8} frame={{ maxWidth: "infinity" }}>
+                  <Text font="footnote">磁盘上那份</Text>
+                  <Spacer />
+                  <Text font="footnote" foregroundStyle={same ? "secondaryLabel" : "systemRed"} lineLimit={1}>
+                    {disk ? `${(disk.model ?? "").trim() || "（没写模型）"} · ${(disk.baseUrl ?? "").trim() || "（空）"}` : "读不到"}
+                  </Text>
+                </HStack>
+                {same ? null : (
+                  <Text font="caption2" foregroundStyle="systemRed">
+                    内存和磁盘不一致：设置没有写进磁盘，或者另一处入口读的是旧配置。快捷指令 / URL 冷启动都是新进程，只认磁盘那份 —— 这就是「聊天能用、快捷指令报错」的常见原因。
+                  </Text>
+                )}
+              </VStack>
+            )
+          })()}
         </Section>
 
         <Section

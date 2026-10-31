@@ -1,5 +1,5 @@
 import {
-  Button, DirectoryBrowserView, HStack, Image, Navigation, NavigationStack, Script, ScrollView, Spacer, Text, Toolbar, ToolbarItem, VStack, ZStack,
+  Button, DirectoryBrowserView, HStack, Image, Navigation, NavigationStack, ScrollView, Spacer, Text, Toolbar, ToolbarItem, VStack, ZStack,
   useEffect, useState,
 } from "scripting"
 import {
@@ -18,7 +18,7 @@ import { useCallbackAutoJob } from "./callback"
 import { useAgentRun } from "./use_agent_run"
 import { keyProblemText } from "../core/agent/config_problem"
 import { appendMessageRecord } from "../core/records/store"
-import { ChatSeed, messageFrom, seedFromMessage } from "../core/agent/url_entry"
+import { ChatSeed } from "../core/agent/url_entry"
 
 // 防止快捷指令回传链式触发：同一时间只允许一条 callback 续跑。
 let callbackContinuationInProgress = false
@@ -29,13 +29,15 @@ interface Props {
   /** 应用壳层可把设置入口切换到底部「设置」标签。 */
   onOpenSettings?: (route?: string) => void
   /**
-   * 取「URL 入口带进来的那条消息」（`scripting://run/智能体?message=…`）。
-   * 挂载后取一次、自动跳会话并发出去；取完由调用方清空，避免切换标签回来重发。
+   * 要执行的一条入口动作（`scripting://run/智能体?message=…`，或从记录页点进来）。
+   * 给了就跳到对应会话、必要时发出去；执行完调用 onSeedConsumed 清空，避免重跑。
    */
-  takeSeed?: () => ChatSeed | null
+  seed?: ChatSeed | null
+  /** 这一条 seed 已经接手了（调用方把 seed 置空）。 */
+  onSeedConsumed?: () => void
 }
 
-export function ChatPage({ embedded = false, onOpenSettings, takeSeed }: Props) {
+export function ChatPage({ embedded = false, onOpenSettings, seed = null, onSeedConsumed }: Props) {
   const dismiss = Navigation.useDismiss()
   const [cfg, setCfg] = useState<AgentConfig>(() => loadConfig())
   // 设置页改了配置（头像 / 名字 / 模型…）立刻同步到这一页，不然界面还显示旧快照。
@@ -64,37 +66,14 @@ export function ChatPage({ embedded = false, onOpenSettings, takeSeed }: Props) 
     busy,
   })
 
-  // App 已经开着时，快捷指令再打开同一个 URL 只会「唤起」而不是重新启动脚本，
-  // 所以这里要接住唤起带来的 message（和快捷指令回传那条一样，都走 Script.onResume）。
+  // 壳层（index.tsx）把入口消息解析好后交下来：跳到对应会话，有文本就发出去。
+  // 处理一条就把 seed 清空，所以这里按 seed 变化触发，能同时覆盖「冷启动」和「从记录页点进来」。
   useEffect(() => {
-    const consume = (params: any) => {
-      const text = messageFrom(params)
-      if (!text.trim()) return
-      void (async () => {
-        try {
-          const seed = await seedFromMessage(text)
-          if (seed) await runSeed(seed)
-        } catch (e: any) {
-          console.log("处理唤起带来的消息失败：" + (e?.message ?? String(e)))
-        }
-      })()
-    }
-    const off = Script.onResume((d: any) => consume(d?.queryParameters ?? null))
-    return () => {
-      if (typeof off === "function") off()
-    }
-  }, [])
-
-  // 冷启动进来时（index.tsx 已经把消息解析好了）就跳到对应会话，然后发出去（只做一次）。
-  const [seedState] = useState(() => ({ done: false }))
-  useEffect(() => {
-    if (!takeSeed || seedState.done) return
-    seedState.done = true
-    const seed = takeSeed()
     if (!seed) return
+    onSeedConsumed?.()
     // 等首帧画完再干：跳会话和发送都会立刻落库并触发界面更新。
     setTimeout(() => void runSeed(seed), 0)
-  }, [])
+  }, [seed])
 
   const current = store.sessions.find((s) => s.id === store.currentId) ?? null
   const messages = current?.messages ?? []
@@ -287,8 +266,13 @@ export function ChatPage({ embedded = false, onOpenSettings, takeSeed }: Props) 
     const images = opts?.images ?? []
     if ((!trimmed && images.length === 0) || busy) return
 
-    if (!cfg.apiKey) {
-      Dialog.alert({ message: keyProblemText(cfg) })
+    // 每次发送都现读配置：这个页面可能开着很久，期间供应商 / 模型 / Key 都可能被改过。
+    // 用挂载时那份快照，会出现「设置里明明是 DeepSeek，这一轮却打到了旧的那家」。
+    const cfgNow = loadConfig()
+    if (cfgNow !== cfg) setCfg(cfgNow)
+
+    if (!cfgNow.apiKey) {
+      Dialog.alert({ message: keyProblemText(cfgNow) })
       openSettings("models")
       return
     }
@@ -311,17 +295,17 @@ export function ChatPage({ embedded = false, onOpenSettings, takeSeed }: Props) 
 
     try {
       // 工具 / MCP / 技能 / 知识库都按设置里的默认配置执行
-      const { newHistory } = await runAgent(trimmed, cfg, base.messages, hooks, {
+      const { newHistory } = await runAgent(trimmed, cfgNow, base.messages, hooks, {
         images,
         workspaceName: base.workspaceName,
         control: run.control,
       })
       run.flush()
-      const capped = capMessagesForSend(newHistory, cfg.maxHistory)
+      const capped = capMessagesForSend(newHistory, cfgNow.maxHistory)
       // 攒够条数就把前面那段压成「记忆摘要」：以前聊天页只按条数硬截断，长对话会直接忘事。
       const sessionForStore: Session = run.control.aborted
         ? { ...base, messages: capped }
-        : await compressHistory(cfg, { ...base, messages: capped })
+        : await compressHistory(cfgNow, { ...base, messages: capped })
       apply(
         upsertSession(live, {
           ...sessionForStore,

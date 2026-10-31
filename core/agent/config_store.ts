@@ -8,7 +8,9 @@ import { AgentConfig } from "./types"
 import { DEFAULT_CONFIG } from "./defaults"
 import { DEFAULT_PERSONA } from "./prompts"
 import { keychainGet, keychainSet } from "./keychain"
-import { mergeConfigPatch, syncActiveProvider, withLegacyProvider } from "./provider"
+import {
+  clearFlatModelFields, mergeConfigPatch, syncActiveProvider, withLegacyProvider,
+} from "./provider"
 import { kvJson, kvWriteJson } from "../store/store"
 
 const KV_KEY = "config"
@@ -59,8 +61,17 @@ function hydrateSecrets(cfg: AgentConfig): AgentConfig {
   }
 }
 
+/** 上一次保存时的供应商 id：用来认出「哪些已经被删了」，顺手清掉它们的 Key。 */
+let lastProviderIds: string[] = []
+
 /** 先写 Keychain，再返回可安全落库的脱敏对象。 */
 function redactSecrets(cfg: AgentConfig): AgentConfig {
+  const ids = (cfg.providers ?? []).map((p) => p.id)
+  for (const id of lastProviderIds) {
+    // 删掉的供应商不该把 Key 留在钥匙串里（以后同 id 复活也不会突然「有 Key」）。
+    if (ids.indexOf(id) < 0) keychainSet("provider/" + id, "")
+  }
+  lastProviderIds = ids
   for (const p of cfg.providers ?? []) keychainSet("provider/" + p.id, p.apiKey)
   for (const s of cfg.mcpServers ?? []) keychainSet("mcp/" + s.id, s.token)
   // 语义检索功能已下线：顺手把遗留的向量服务密钥从 Keychain 清掉。
@@ -101,8 +112,22 @@ export async function hydrateConfig(): Promise<void> {
     return
   }
 
-  const merged: any = { ...DEFAULT_CONFIG, ...parsed }
+  let merged: any = { ...DEFAULT_CONFIG, ...parsed }
   let changed = false
+
+  // 盘上明确写着「一家供应商都没有」= 用户自己删光过。这时扁平字段里残留的上一家
+  // 不能再被当成「老配置」复活，否则删掉的供应商下次启动又回来（用户看到的就是
+  // 「明明删了，怎么还在用硅基流动」）。
+  //
+  // 判断看的是**盘上那份**（parsed）有没有 providers 键：真的老配置里根本没这个键，
+  // 那种才该从扁平字段迁移出一家来。
+  if (Array.isArray((parsed as any).providers) && (parsed as any).providers.length === 0) {
+    const stale = !!((merged.baseUrl ?? "").trim() || (merged.model ?? "").trim())
+    if (stale) {
+      merged = clearFlatModelFields(merged)
+      changed = true
+    }
+  }
   for (const key of ["embedEnabled", "embedBaseUrl", "embedPath", "embedApiKey", "embedModel"]) {
     if (key in merged) {
       delete merged[key]
@@ -130,6 +155,8 @@ export async function hydrateConfig(): Promise<void> {
   if (hasPlaintextSecrets) changed = true
 
   cache = withDefaults(merged)
+  // 记下「启动时盘上有哪些供应商」，之后第一次保存就能认出被删掉的那些、清掉它们的 Key。
+  lastProviderIds = (cache.providers ?? []).map((p) => p.id)
   // 升级过的老配置顺手写回去，库里就不再留着废弃字段。
   if (changed) await saveConfig(cache)
 }

@@ -6,6 +6,8 @@ import { McpTool, callMcpTool, collectMcpTools } from "../mcp/client"
 import { formatKbHits, kbStats, searchKb } from "../kb/store"
 import { listSkills, readSkill, skillsPrompt } from "../skills/store"
 import { addPending, finishPending } from "./tool_callback"
+import { describeRequest, httpErrorText } from "./http_error"
+import { activeProvider } from "./provider"
 import { CapResult, Capability, capabilitiesFor } from "./capabilities"
 import { RunSource, clipError, logRun } from "../diagnostics/store"
 
@@ -23,6 +25,15 @@ type LLMMessage = {
     function: { name: string; arguments: string }
   }>
   tool_call_id?: string
+}
+
+/** 接口地址里的主机名（诊断里用来分辨「是不是打了另一家」）。 */
+function hostOf(url: string): string {
+  return (url ?? "")
+    .trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .split("/")[0]
+    .split(":")[0]
 }
 
 function endpoint(cfg: AgentConfig): string {
@@ -160,7 +171,19 @@ async function postChat(
 
     if (!resp.ok) {
       const text = await resp.text()
-      const err: any = new Error(`接口错误 ${resp.status}：${text.slice(0, 300)}`)
+      const provider = activeProvider(cfg)
+      // 末尾多带一行「这次用的是谁」：两条入口（聊天页 / URL 唤起）结果不一样时，
+      // 第一件要排除的就是「是不是用了另一家 / 另一个模型 / 另一把 Key」。
+      const err: any = new Error(
+        httpErrorText(resp.status, text) +
+          "\n" +
+          describeRequest({
+            name: provider?.name,
+            baseUrl: cfg.baseUrl,
+            model: cfg.model,
+            apiKey: cfg.apiKey,
+          }),
+      )
       err.httpStatus = resp.status
       if (RETRYABLE_STATUS.indexOf(resp.status) >= 0 && attempt < RETRY_ATTEMPTS - 1) {
         lastErr = err
@@ -1213,6 +1236,8 @@ async function runLogged(
       outputTokens: out.assistant.usage?.outputTokens,
       cachedInputTokens: out.assistant.usage?.cachedInputTokens,
       model: cfg.model,
+      provider: activeProvider(cfg)?.name,
+      host: hostOf(cfg.baseUrl),
     })
     const { reply, newHistory } = wrap(out)
     return { reply, newHistory, steps: out.steps, reasoning: out.reasoning }
@@ -1227,6 +1252,8 @@ async function runLogged(
       failedTools: 0,
       aborted: opts?.control?.aborted || undefined,
       model: cfg.model,
+      provider: activeProvider(cfg)?.name,
+      host: hostOf(cfg.baseUrl),
       error: clipError(e),
     })
     throw e

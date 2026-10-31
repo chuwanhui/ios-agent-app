@@ -54,9 +54,17 @@ export function activeProvider(cfg: AgentConfig): ModelProvider | undefined {
   return hit ?? list[0]
 }
 
-/** 没有供应商列表（老配置 / 全新配置）时，把扁平的模型字段搬成一家。 */
+/**
+ * 没有供应商列表时，把扁平的模型字段搬成一家。
+ *
+ * 但**只在这份扁平字段里真的还有东西时**才搬：用户把供应商全删掉之后，扁平字段应该
+ * 是空的，「空」就该老实表示「一家都没有」。以前这里无条件造一家，于是删掉的那家
+ * （比如硅基流动）在下次启动时又从残留的 baseUrl / model 里原地复活，看起来像删不掉。
+ */
 export function withLegacyProvider(cfg: AgentConfig): AgentConfig {
   if (Array.isArray(cfg.providers) && cfg.providers.length > 0) return cfg
+  const hasLegacy = !!((cfg.baseUrl ?? "").trim() || (cfg.apiKey ?? "").trim() || (cfg.model ?? "").trim())
+  if (!hasLegacy) return cfg
   const p: ModelProvider = {
     id: makeProvider().id,
     name: suggestProviderName(cfg.baseUrl) || "默认",
@@ -75,12 +83,36 @@ export function withLegacyProvider(cfg: AgentConfig): AgentConfig {
 }
 
 /**
+ * 把扁平模型字段清空（供应商一家都不剩时用）。
+ *
+ * 为什么必须清：`withLegacyProvider` 会拿这些字段「复活」一家供应商。删光之后它们还留着
+ * 上一家的地址和模型，下次启动那家就原地回来了 —— 用户看到的就是「删了还在用硅基流动」。
+ */
+export function clearFlatModelFields(cfg: AgentConfig): AgentConfig {
+  return {
+    ...cfg,
+    activeProviderId: "",
+    apiKey: "",
+    baseUrl: "",
+    apiPath: "/chat/completions",
+    model: "",
+    modelOptions: undefined,
+    modelOptionsAt: undefined,
+    balanceText: undefined,
+    balanceDetail: undefined,
+    balanceSource: undefined,
+    balanceAt: undefined,
+  }
+}
+
+/**
  * 把「当前使用」那家的字段同步到扁平字段上 —— 老代码（core/agent/core / intent / widget）
  * 只认 apiKey / baseUrl / apiPath / model / 余额这几个扁平字段，靠这一步保持一致。
  */
 export function syncActiveProvider(cfg: AgentConfig): AgentConfig {
   const p = activeProvider(cfg)
-  if (!p) return cfg
+  // 一家都不剩（用户删光了）时，扁平字段必须一起清空，否则下次启动又会被复活成一家。
+  if (!p) return clearFlatModelFields(cfg)
   return {
     ...cfg,
     activeProviderId: p.id,
