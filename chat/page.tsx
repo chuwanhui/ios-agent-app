@@ -1,5 +1,5 @@
 import {
-  Button, DirectoryBrowserView, HStack, Image, Navigation, NavigationStack, ScrollView, Spacer, Text, Toolbar, ToolbarItem, VStack, ZStack,
+  Button, DirectoryBrowserView, HStack, Image, Navigation, NavigationStack, Script, ScrollView, Spacer, Text, Toolbar, ToolbarItem, VStack, ZStack,
   useEffect, useState,
 } from "scripting"
 import {
@@ -16,6 +16,9 @@ import { AssistantMessage, Bubble, EmptyState, LiveThinking } from "./message"
 import { ChatInputBar } from "./input"
 import { useCallbackAutoJob } from "./callback"
 import { useAgentRun } from "./use_agent_run"
+import { keyProblemText } from "../core/agent/config_problem"
+import { appendMessageRecord } from "../core/records/store"
+import { ChatSeed, messageFrom, seedFromMessage } from "../core/agent/url_entry"
 
 // 防止快捷指令回传链式触发：同一时间只允许一条 callback 续跑。
 let callbackContinuationInProgress = false
@@ -25,9 +28,14 @@ interface Props {
   embedded?: boolean
   /** 应用壳层可把设置入口切换到底部「设置」标签。 */
   onOpenSettings?: (route?: string) => void
+  /**
+   * 取「URL 入口带进来的那条消息」（`scripting://run/智能体?message=…`）。
+   * 挂载后取一次、自动跳会话并发出去；取完由调用方清空，避免切换标签回来重发。
+   */
+  takeSeed?: () => ChatSeed | null
 }
 
-export function ChatPage({ embedded = false, onOpenSettings }: Props) {
+export function ChatPage({ embedded = false, onOpenSettings, takeSeed }: Props) {
   const dismiss = Navigation.useDismiss()
   const [cfg, setCfg] = useState<AgentConfig>(() => loadConfig())
   // 设置页改了配置（头像 / 名字 / 模型…）立刻同步到这一页，不然界面还显示旧快照。
@@ -55,6 +63,38 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
     onFire: (out) => void continueAfterCallback(out.sessionId),
     busy,
   })
+
+  // App 已经开着时，快捷指令再打开同一个 URL 只会「唤起」而不是重新启动脚本，
+  // 所以这里要接住唤起带来的 message（和快捷指令回传那条一样，都走 Script.onResume）。
+  useEffect(() => {
+    const consume = (params: any) => {
+      const text = messageFrom(params)
+      if (!text.trim()) return
+      void (async () => {
+        try {
+          const seed = await seedFromMessage(text)
+          if (seed) await runSeed(seed)
+        } catch (e: any) {
+          console.log("处理唤起带来的消息失败：" + (e?.message ?? String(e)))
+        }
+      })()
+    }
+    const off = Script.onResume((d: any) => consume(d?.queryParameters ?? null))
+    return () => {
+      if (typeof off === "function") off()
+    }
+  }, [])
+
+  // 冷启动进来时（index.tsx 已经把消息解析好了）就跳到对应会话，然后发出去（只做一次）。
+  const [seedState] = useState(() => ({ done: false }))
+  useEffect(() => {
+    if (!takeSeed || seedState.done) return
+    seedState.done = true
+    const seed = takeSeed()
+    if (!seed) return
+    // 等首帧画完再干：跳会话和发送都会立刻落库并触发界面更新。
+    setTimeout(() => void runSeed(seed), 0)
+  }, [])
 
   const current = store.sessions.find((s) => s.id === store.currentId) ?? null
   const messages = current?.messages ?? []
@@ -209,22 +249,55 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
   }
 
   /**
-   * 发消息。
-   * opts.images：这次输入附带的图片（磁盘路径）。
+   * 通知收尾：把这一轮写进「记录」页。
+   *
+   * 去重记录在「进入聊天页之前」就写好了（见 url_entry.ts），队列里那条也早摘掉了，
+   * 所以这里只管一份给用户看的记录。
    */
-  async function send(text: string, opts?: { images?: string[] }) {
+  function finishNotify(
+    n: { app: string; sender: string; content: string },
+    reply: string,
+  ) {
+    try {
+      appendMessageRecord({ app: n.app, sender: n.sender, content: n.content, reply })
+    } catch {
+      // 记录写失败不影响这一轮的结果
+    }
+  }
+
+  /** 按 URL 入口给的 seed 干活：先切到目标会话，再把文本发出去。 */
+  async function runSeed(seed: ChatSeed) {
+    // 用磁盘上的最新数据算：这一轮可能在 App 刚启动时跑，state 还不是最新的。
+    const live = loadStore()
+    const target = seed.sessionId ? live.sessions.find((s) => s.id === seed.sessionId) : null
+    if (target) apply(upsertSession(live, target))
+    if (!seed.text.trim()) return
+    await send(seed.text, { sessionId: seed.sessionId, notify: seed.notify })
+  }
+
+  /**
+   * 发消息。
+   * opts.images：这次输入附带的图片（磁盘路径）；
+   * opts.sessionId：指定落到哪条会话（URL 入口用）；
+   * opts.notify：这一轮来自通知，跑完写一条记录到「记录」页。
+   */
+  async function send(text: string, opts?: { images?: string[]; sessionId?: string; notify?: ChatSeed["notify"] }) {
     const trimmed = text.trim()
     // 图片可以没有文字，但必须有图或有文字其一
     const images = opts?.images ?? []
     if ((!trimmed && images.length === 0) || busy) return
 
     if (!cfg.apiKey) {
-      Dialog.alert({ message: "还没配置：点右上角齿轮填一下 API Key" })
+      Dialog.alert({ message: keyProblemText(cfg) })
       openSettings("models")
       return
     }
 
-    const base = current ?? makeSession()
+    // 指定了会话就用磁盘上那条（URL 入口），否则用当前会话。
+    const live = opts?.sessionId ? loadStore() : store
+    const base = opts?.sessionId
+      ? (live.sessions.find((s) => s.id === opts.sessionId) ?? makeSession())
+      : (current ?? makeSession())
     const isFirst = base.messages.length === 0
 
     setInput("")
@@ -233,7 +306,7 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
       content: trimmed,
       images: images.length > 0 ? images : undefined,
     }
-    apply(upsertSession(store, { ...base, messages: [...base.messages, userMsg], updatedAt: Date.now() }))
+    apply(upsertSession(live, { ...base, messages: [...base.messages, userMsg], updatedAt: Date.now() }))
     const hooks = run.begin({ onToolsCreated: () => setCfg(loadConfig()) })
 
     try {
@@ -250,12 +323,18 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
         ? { ...base, messages: capped }
         : await compressHistory(cfg, { ...base, messages: capped })
       apply(
-        upsertSession(store, {
+        upsertSession(live, {
           ...sessionForStore,
           updatedAt: Date.now(),
-          title: isFirst ? deriveTitle(sessionForStore.messages) : base.title,
+          // 通知会话的标题是「张三（微信）」，别被第一条消息改掉。
+          title: isFirst && !base.memoryKey ? deriveTitle(sessionForStore.messages) : base.title,
         }),
       )
+      // 通知：记到「记录」页，并把这条从队列里彻底结账（写去重记录）。
+      if (opts?.notify) {
+        const last = sessionForStore.messages[sessionForStore.messages.length - 1]
+        finishNotify(opts.notify, run.control.aborted ? "" : (last?.content ?? ""))
+      }
     } catch (e: any) {
       const errMsg = "出错：" + (e?.message ?? String(e))
       const failed: ChatMessage[] = [
@@ -269,13 +348,14 @@ export function ChatPage({ embedded = false, onOpenSettings }: Props) {
         { role: "assistant", content: errMsg, contextExcluded: true },
       ]
       apply(
-        upsertSession(store, {
+        upsertSession(live, {
           ...base,
           messages: failed,
           updatedAt: Date.now(),
-          title: isFirst ? deriveTitle(failed) : base.title,
+          title: isFirst && !base.memoryKey ? deriveTitle(failed) : base.title,
         }),
       )
+      if (opts?.notify) finishNotify(opts.notify, errMsg)
     } finally {
       // 兜底清理本轮已发送的缩略图；保留请求期间新选择的其他图片。
       if (images.length > 0) {

@@ -18,6 +18,7 @@ import {
   shortcutProtocolText,
   toolParamSpecs,
 } from "../core/agent/store"
+import { shortcutRunURL } from "../core/agent/core"
 import { pushRoute, registerRoute } from "../app/nav_route"
 import { SettingsEmptyRow, SettingsListRow, SettingsSummaryRow } from "../ui/settings"
 import { FieldRow } from "../ui/forms"
@@ -168,12 +169,6 @@ function scriptName(): string {
 /** 回传 URL 的固定部分；callId 必须从本次快捷指令收到的 JSON 输入中取出。 */
 function callbackURL(shortcut: string): string {
   return "scripting://run/" + scriptName() + "?tool=" + encodeURIComponent(shortcut) + "&callId="
-}
-
-function runShortcutURL(name: string, input?: string): string {
-  const base = "shortcuts://run-shortcut?name=" + encodeURIComponent(name)
-  if (!input) return base
-  return base + "&input=text&text=" + encodeURIComponent(input)
 }
 
 function sampleValue(s: ToolParamSpec): any {
@@ -453,7 +448,7 @@ export function ToolDetail({ index, initial, onChange }: DetailProps) {
     }
     const input = sampleArgsJSON(paramDraftsToSpecs(t.params ?? []))
     try {
-      const ok = await Safari.openURL(runShortcutURL(name, input))
+      const ok = await Safari.openURL(shortcutRunURL(name, input))
       setNote(
         ok
           ? `已交给系统运行${input ? "，输入：" + input : "（不带输入）"}。要是没任何反应，就是名字和 App 里对不上。`

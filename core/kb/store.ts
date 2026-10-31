@@ -15,9 +15,9 @@ export const KB_INBOX = FileManager.documentsDirectory + "/知识库"
 /** 导入完成的资料归档目录。 */
 export const KB_DONE = KB_INBOX + "/已导入"
 
-import { kvJson, kvWriteJson } from "../db/db"
+import { kvJson, kvWriteJson } from "../store/store"
 
-/** 索引在 kv 表里的键（正文分块比较大，但仍然是一条记录整体替换）。 */
+/** 索引在 kv 里的键（正文分块比较大，但仍然是一个文件整体替换）。 */
 const KB_INDEX_KEY = "kb.index"
 const KB_FOLDERS_KEY = "kb.folders"
 
@@ -83,7 +83,7 @@ let termMemo = new Map<string, Map<string, number>>()
 export async function hydrateKb(): Promise<void> {
   let idx = emptyIndex()
   try {
-    const parsed = await kvJson<KbIndex>(KB_INDEX_KEY)
+    const parsed = kvJson<KbIndex>(KB_INDEX_KEY)
     if (parsed && Array.isArray(parsed.chunks) && Array.isArray(parsed.docs)) {
       idx = {
         version: 1,
@@ -111,10 +111,8 @@ export function saveKbIndex(idx: KbIndex): void {
   idx.updatedAt = Date.now()
   cache = idx
   termMemo = new Map()
-  void kvWriteJson(KB_INDEX_KEY, idx).catch((e) => {
-    // 写不进去也不该让对话崩掉
-    console.log("保存知识库索引失败：" + (e?.message ?? String(e)))
-  })
+  // 写不进去也不该让对话崩掉
+  kvWriteJson(KB_INDEX_KEY, idx)
 }
 
 export function kbStats(): { docs: number; chunks: number; chars: number } {
@@ -376,7 +374,7 @@ let folderCache: KbFolder[] | null = null
 export async function hydrateKbFolders(): Promise<void> {
   let out: KbFolder[] = []
   try {
-    const parsed = await kvJson<KbFolder[]>(KB_FOLDERS_KEY)
+    const parsed = kvJson<KbFolder[]>(KB_FOLDERS_KEY)
     if (Array.isArray(parsed)) out = parsed
   } catch {
     out = []
@@ -390,9 +388,7 @@ export function listKbFolders(): KbFolder[] {
 
 function saveKbFolders(list: KbFolder[]): void {
   folderCache = list
-  void kvWriteJson(KB_FOLDERS_KEY, list).catch((e) => {
-    console.log("保存知识库文件夹失败：" + (e?.message ?? String(e)))
-  })
+  kvWriteJson(KB_FOLDERS_KEY, list)
 }
 
 export function addKbFolder(bookmark: string, label: string, path: string): KbFolder {

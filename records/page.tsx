@@ -4,10 +4,10 @@ import {
 } from "scripting"
 import { MessageRecord, clearMessageRecords, loadMessageRecords } from "../core/records/store"
 import {
-  NotifyQueueItem, dropQueueItem, failedQueueItems, queueSize, retryQueueItem,
+  NotifyQueueItem, clearQueue, dropQueueItem, failedQueueItems, queueSize, retryQueueItem,
 } from "../core/notify/queue"
 import { SettingsEmptyRow } from "../ui/settings"
-import { NOTIFY_TEMPLATE_JSON, notifyDocMarkdown } from "./notify_doc"
+import { NOTIFY_TEMPLATE_JSON, notifyDocMarkdown, urlEntryDoc } from "./notify_doc"
 
 /** 本脚本在「快捷指令」里的名字（说明文档里要写它）。 */
 function scriptName(): string {
@@ -150,6 +150,7 @@ export function RecordsPage() {
   /** 「怎么接微信 / 钉钉」那份说明默认收起，要看才展开。 */
   const [docOpen, setDocOpen] = useState(false)
   const [docNote, setDocNote] = useState("")
+  const [runDocOpen, setRunDocOpen] = useState(false)
 
   function refresh() {
     setItems(loadMessageRecords())
@@ -157,14 +158,25 @@ export function RecordsPage() {
     setPending(queueSize())
   }
 
+  /**
+   * 一次清干净：已完成的记录 + 还在排队的 + 处理失败的。
+   *
+   * 只清记录会留下一个怪现象：本页看着空了，可队列里还压着几条，
+   * 下次打开 App 它们又冒出来继续跑。
+   */
   async function clearAll() {
+    const parts: string[] = []
+    if (items.length > 0) parts.push(`${items.length} 条记录`)
+    if (pending > 0) parts.push(`${pending} 条等待处理的通知`)
+    if (failed.length > 0) parts.push(`${failed.length} 条处理失败的通知`)
     const ok = await Dialog.confirm({
       title: "清空记录",
-      message: "确定要清空所有通知与回复记录吗？",
+      message: `会清掉${parts.join("、") || "所有记录"}，队列里等着的一条也不留。清完再跑同一条消息，会当成新消息重新处理。`,
       confirmLabel: "清空",
     })
     if (!ok) return
     clearMessageRecords()
+    clearQueue()
     refresh()
   }
 
@@ -216,7 +228,35 @@ export function RecordsPage() {
               <Text foregroundStyle={failed.length > 0 ? "systemRed" : "secondaryLabel"}>{String(failed.length)}</Text>
             </HStack>
             <Button title="刷新" systemImage="arrow.clockwise" action={refresh} />
-            <Button title="清空记录" role="destructive" systemImage="trash" action={clearAll} disabled={items.length === 0} />
+            <Button
+              title="清空记录"
+              role="destructive"
+              systemImage="trash"
+              action={clearAll}
+              disabled={items.length === 0 && pending === 0 && failed.length === 0}
+            />
+          </Section>
+
+          <Section
+            header={<Text>怎么把消息送进来</Text>}
+            footer={
+              <Text>
+                推荐用「打开 URL」调 `scripting://run/{scriptName()}?message=…`：App 会被拉到前台，AI 才能正常触发快捷指令。用「运行脚本」是后台进程，iOS 不允许后台拉别的 App。
+              </Text>
+            }
+          >
+            <DisclosureGroup
+              isExpanded={runDocOpen}
+              onChanged={setRunDocOpen}
+              label={<Label title="message 链接怎么拼" systemImage="link" />}
+            >
+              <Markdown
+                content={urlEntryDoc(scriptName())}
+                theme="github"
+                useDefaultHighlighterTheme
+                scrollable={false}
+              />
+            </DisclosureGroup>
           </Section>
 
           {failed.length > 0 ? (

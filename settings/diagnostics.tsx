@@ -1,9 +1,9 @@
-import { Button, Form, HStack, Section, Spacer, Text, VStack, useEffect, useState } from "scripting"
+import { Button, Form, HStack, ProgressView, Section, Spacer, Text, VStack, useEffect, useState } from "scripting"
 import {
   RunLogEntry, RunSource, clearRunLog, loadRunLog, runLogStats,
 } from "../core/diagnostics/store"
-import { compactDb, dbPath, dbStats } from "../core/db/db"
-import { storageDegraded } from "../core/db/init"
+import { compactStore, dataPath, storeStats } from "../core/store/store"
+import { bootTimings, storageDegraded } from "../core/store/init"
 import { SettingsEmptyRow, SettingsSummaryRow } from "../ui/settings"
 
 /**
@@ -92,6 +92,7 @@ interface StorageInfo {
   sessions: number
   records: number
   runs: number
+  tempFiles: number
 }
 
 export function DiagnosticsPage() {
@@ -100,7 +101,7 @@ export function DiagnosticsPage() {
 
   function refresh() {
     setEntries(loadRunLog())
-    void dbStats()
+    void storeStats()
       .then((s) => setStorage(s))
       .catch(() => setStorage(null))
   }
@@ -111,8 +112,11 @@ export function DiagnosticsPage() {
 
   async function compact() {
     try {
-      await compactDb()
+      const removed = await compactStore()
       refresh()
+      Dialog.alert({
+        message: removed > 0 ? `清掉了 ${removed} 个残留文件。` : "没有找到残留文件，不需要清理。",
+      })
     } catch (e: any) {
       Dialog.alert({ message: "整理失败：" + (e?.message ?? String(e)) })
     }
@@ -208,32 +212,67 @@ export function DiagnosticsPage() {
           header={<Text>数据存在哪</Text>}
           footer={
             <Text>
-              配置、聊天记录、通知记录、索引、队列全在这一个 SQLite 文件里；Key 不在这里，它在系统钥匙串。
+              配置、聊天记录、通知记录、索引、队列全在这一个目录里（一个键一个文件，备份就拷它）；Key 不在这里，它在系统钥匙串。
             </Text>
           }
         >
           <VStack spacing={3} padding={{ vertical: 4 }}>
             <Text font="footnote" foregroundStyle="secondaryLabel" lineLimit={2}>
-              {dbPath()}
+              {dataPath()}
             </Text>
             {storageDegraded() ? (
               <Text font="caption2" foregroundStyle="systemRed">
-                本次没能打开数据库，改动只在内存里，退出后就没了。检查一下手机存储空间。
+                本次写不进数据目录，改动只在内存里，退出后就没了。检查一下手机存储空间。
               </Text>
             ) : null}
             {storage ? (
               <Text font="caption2" foregroundStyle="tertiaryLabel">
-                {`${fmtBytes(storage.bytes)} · 会话 ${storage.sessions} 个 · 通知记录 ${storage.records} 条 · 诊断 ${storage.runs} 条`}
+                {`${fmtBytes(storage.bytes)} · 会话 ${storage.sessions} 个 · 通知记录 ${storage.records} 条 · 诊断 ${storage.runs} 条${storage.tempFiles > 0 ? ` · 残留 ${storage.tempFiles} 个` : ""}`}
               </Text>
             ) : (
               <Text font="caption2" foregroundStyle="tertiaryLabel">读取中…</Text>
             )}
           </VStack>
           <Button
-            title="整理数据库（VACUUM）"
+            title="清理残留文件"
             systemImage="arrow.triangle.2.circlepath"
             action={compact}
           />
+        </Section>
+
+        <Section
+          header={<Text>启动耗时</Text>}
+          footer={
+            <Text>
+              快捷指令 / 小组件每次都是新进程，这里是把数据从磁盘读进内存花的时间（不含模型请求）。哪一段特别大，就说明那一块该瘦身。
+            </Text>
+          }
+        >
+          {(() => {
+            const boot = bootTimings()
+            if (!boot) {
+              return <SettingsEmptyRow icon="stopwatch" title="还没有记录" detail="重启一次 App 就能看到。" />
+            }
+            const slow = Math.max(1, ...boot.phases.map((p) => p.ms))
+            return (
+              <VStack spacing={6} padding={{ vertical: 4 }} alignment="leading" frame={{ maxWidth: "infinity", alignment: "leading" }}>
+                <Text font="footnote" foregroundStyle="secondaryLabel">
+                  {`合计 ${boot.totalMs}ms${boot.degraded ? "（数据目录不可写）" : ""}`}
+                </Text>
+                {boot.phases.map((p) => (
+                  <HStack key={p.label} spacing={8}>
+                    <Text font="caption" foregroundStyle="label" frame={{ width: 96, alignment: "leading" }} lineLimit={1}>
+                      {p.label}
+                    </Text>
+                    <ProgressView value={p.ms / slow} />
+                    <Text font="caption2" foregroundStyle="tertiaryLabel" frame={{ width: 56, alignment: "trailing" }}>
+                      {`${p.ms}ms`}
+                    </Text>
+                  </HStack>
+                ))}
+              </VStack>
+            )
+          })()}
         </Section>
 
         <Section>

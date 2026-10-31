@@ -1,15 +1,25 @@
 import { Label, Navigation, Script, TabView, VStack, useState } from "scripting"
 import { CapabilitiesPage } from "./capabilities/page"
 import { ChatPage } from "./chat/page"
+import { ChatSeed, messageParam, seedFromMessage } from "./core/agent/url_entry"
 import { ConfigPage } from "./settings/page"
 import { RecordsPage } from "./records/page"
 import { loadStore, pruneOrphanImages } from "./core/agent/store"
 import { drainNotifications } from "./core/notify/drain"
 import { openRootRoute, willSwitchTabOnRoot } from "./app/nav_route"
-import { initStorage } from "./core/db/init"
+import { initStorage } from "./core/store/init"
 
-function AgentApp() {
+function AgentApp({ initialSeed = null }: { initialSeed?: ChatSeed | null }) {
   const [tabIndex, setTabIndex] = useState(0)
+  /** 第一次进聊天页时要处理的那条（见下面 run() 里的 URL 入口）。 */
+  const [seed, setSeed] = useState<ChatSeed | null>(initialSeed)
+
+  // 只处理一次：取走就清空，否则切换标签回来会重发。
+  function consumeSeed(): ChatSeed | null {
+    const value = seed
+    if (value) setSeed(null)
+    return value
+  }
 
   function openSettings(route = "") {
     willSwitchTabOnRoot(null) // 清除能力标签的回调
@@ -33,7 +43,7 @@ function AgentApp() {
         tabItem={<Label title="聊天" systemImage="bubble.left.and.bubble.right.fill" />}
         frame={{ maxWidth: "infinity", maxHeight: "infinity" }}
       >
-        <ChatPage embedded onOpenSettings={openSettings} />
+        <ChatPage embedded onOpenSettings={openSettings} takeSeed={consumeSeed} />
       </VStack>
       <VStack
         tag={1}
@@ -71,6 +81,17 @@ async function run() {
     // 清理失败不影响启动
   }
 
+  // —— URL 入口：scripting://run/智能体?message=… ——
+  // 快捷指令用「打开 URL」把 App 拉到前台再跑，AI 才是真的在前台，
+  // 需要时能正常拉起别的快捷指令（后台进程做不到，这是 iOS 的限制）。
+  // 通知会落到「App + 发件人」那条会话上，普通文本就落在当前会话。
+  let seed: ChatSeed | null = null
+  try {
+    seed = await seedFromMessage(messageParam())
+  } catch (e: any) {
+    console.log("处理 URL 入口消息失败：" + (e?.message ?? String(e)))
+  }
+
   // 打开就把积压的通知排空（以前只有「下一条通知到达」时才会顺带触发）。
   // 不 await：界面先出来，队列在后台跑。
   try {
@@ -80,7 +101,7 @@ async function run() {
   }
 
   await Navigation.present({
-    element: <AgentApp />,
+    element: <AgentApp initialSeed={seed} />,
     modalPresentationStyle: "fullScreen",
   })
   Script.exit()

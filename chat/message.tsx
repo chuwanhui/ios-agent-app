@@ -1,5 +1,5 @@
 import {
-  EmptyView, HStack, Image, ProgressView, Spacer, Text, VStack, useState,
+  Button, EmptyView, HStack, Image, ProgressView, Spacer, Text, VStack, useState,
 } from "scripting"
 import { ChatMessage, TokenUsage, ToolStep } from "../core/agent/store"
 import { toolKindLabel } from "../core/agent/core"
@@ -60,6 +60,31 @@ export function StepRow({ step, defaultOpen = false }: { step: ToolStep; default
         />
         <Text font="caption2" foregroundStyle="tertiaryLabel">{step.ms}ms</Text>
       </HStack>
+      {open && step.url ? (
+        <VStack spacing={6} alignment="leading" frame={{ maxWidth: "infinity", alignment: "leading" }}>
+          <Text font="caption2" foregroundStyle="tertiaryLabel">打开的链接</Text>
+          <Text font="caption2" foregroundStyle="secondaryLabel" lineLimit={3}>{step.url}</Text>
+          <HStack spacing={8}>
+            <Button
+              title="复制链接"
+              systemImage="doc.on.clipboard"
+              action={() => {
+                void Pasteboard.setString(step.url ?? "").catch(() => {})
+              }}
+            />
+            <Button
+              title="再打开一次"
+              systemImage="arrow.up.right.square"
+              action={() => {
+                void Safari.openURL(step.url ?? "").catch(() => {})
+              }}
+            />
+          </HStack>
+          <Text font="caption2" foregroundStyle="tertiaryLabel">
+            没反应就是名字和「快捷指令」App 里对不上（系统不会报错，只会什么都不做）。把这行复制到 Safari 里能跑，说明名字是对的。
+          </Text>
+        </VStack>
+      ) : null}
       {open && step.args ? (
         <VStack spacing={3} alignment="leading" frame={{ maxWidth: "infinity", alignment: "leading" }}>
           <Text font="caption2" foregroundStyle="tertiaryLabel">调用参数</Text>

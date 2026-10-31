@@ -1,4 +1,4 @@
-import { acquireLock, kvJson, kvWriteJson, refreshLock, releaseLock } from "../db/db"
+import { acquireLock, kvJson, kvWriteJson, refreshLock, releaseLock } from "../store/store"
 
 export interface NotifyEnvelope {
   app: string
@@ -27,7 +27,7 @@ interface QueueFile {
   seen: SeenItem[]
 }
 
-/** 队列在 kv 表里的键。锁在 locks 表里（跨进程可见，所以不走内存）。 */
+/** 队列在 kv 里的键。锁是 `data/locks/` 下的目录（跨进程可见，所以不走内存）。 */
 const QUEUE_KEY = "notify.queue"
 const LOCK_NAME = "notify"
 const MAX_ITEMS = 300
@@ -59,7 +59,7 @@ export function dedupeKeyOf(input: NotifyEnvelope): string {
 let queueCache: QueueFile | null = null
 
 export async function hydrateQueue(): Promise<void> {
-  const parsed = await kvJson<Partial<QueueFile>>(QUEUE_KEY)
+  const parsed = kvJson<Partial<QueueFile>>(QUEUE_KEY)
   queueCache = {
     items: Array.isArray(parsed?.items) ? (parsed!.items as NotifyQueueItem[]) : [],
     seen: Array.isArray(parsed?.seen) ? (parsed!.seen as SeenItem[]) : [],
@@ -72,9 +72,7 @@ function readQueue(): QueueFile {
 
 function writeQueue(file: QueueFile): void {
   queueCache = file
-  void kvWriteJson(QUEUE_KEY, file).catch((e) => {
-    console.log("保存通知队列失败：" + (e?.message ?? String(e)))
-  })
+  kvWriteJson(QUEUE_KEY, file)
 }
 
 function prune(file: QueueFile, now = Date.now()): QueueFile {
@@ -135,9 +133,20 @@ export function dueQueueItems(limit = 10, now = Date.now()): NotifyQueueItem[] {
 
 export function markQueueSuccess(item: NotifyQueueItem): void {
   const file = prune(readQueue())
-  const key = dedupeKeyOf(item)
   file.items = file.items.filter((x) => x.id !== item.id)
-  file.seen = [...file.seen, { key, at: Date.now() }].slice(-MAX_SEEN)
+  file.seen = [...file.seen, { key: dedupeKeyOf(item), at: Date.now() }].slice(-MAX_SEEN)
+  writeQueue(file)
+}
+
+/**
+ * 只写「已处理过」的去重记录，不碰队列。
+ *
+ * 给「前台直接跑掉」的那条收尾用：`scripting://run/智能体?message=…` 会把通知从队列里
+ * 取出来、在聊天页里跑，收尾时只需要记住「这条处理过了」，免得下次又被当成新消息。
+ */
+export function markNotificationSeen(input: NotifyEnvelope): void {
+  const file = prune(readQueue())
+  file.seen = [...file.seen, { key: dedupeKeyOf(input), at: Date.now() }].slice(-MAX_SEEN)
   writeQueue(file)
 }
 
@@ -179,6 +188,17 @@ export function retryQueueItem(id: string): void {
   if (idx < 0) return
   file.items[idx] = { ...file.items[idx], failed: undefined, attempts: 0, nextAttemptAt: Date.now() }
   writeQueue(file)
+}
+
+/**
+ * 清空队列：等待处理的、处理失败的，连同「已处理过」的去重记录一起清掉。
+ *
+ * 为什么要连去重记录一起清：界面上这个按钮叫「清空记录」，用户点完再跑一次同一条通知，
+ * 期待的是「重新处理一遍」。只清 items 的话，`seen` 里那条还在，会立刻被当成重复丢掉，
+ * 表现就是「点了清空，再跑还是说处理过」。
+ */
+export function clearQueue(): void {
+  writeQueue({ items: [], seen: [] })
 }
 
 /** 手动丢弃一条通知（成功或失败都能删）。 */

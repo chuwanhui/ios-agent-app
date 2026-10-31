@@ -774,13 +774,68 @@ async function buildToolSpecs(
  * 只有 `input=text` 才会把 `text` 当作「快捷指令输入」传进去；
  * 直接写 `input=<内容>`（早期版本）是收不到的。
  * 无参数时不带 input，快捷指令就以「无输入」运行。
+ *
+ * 设置页的「试跑」也走这里，保证两处拼出来的链接永远一样。
  */
-export function buildShortcutURL(tool: AgentTool, inputText?: string): string {
-  const name = (tool.shortcutName ?? "").trim()
+export function shortcutRunURL(shortcutName: string, inputText?: string): string {
+  const name = (shortcutName ?? "").trim()
   if (!name) return ""
   const base = "shortcuts://run-shortcut?name=" + encodeURIComponent(name)
   if (!inputText) return base
   return base + "&input=text&text=" + encodeURIComponent(inputText)
+}
+
+/** 链接超过这个长度就改用剪贴板传输入（中文编码后会膨胀，长消息很容易撑爆）。 */
+const MAX_INLINE_URL = 1900
+
+/**
+ * 真正把快捷指令拉起来。
+ *
+ * 四个坑都在这里兜住：
+ *   ① `Safari.openURL` 返回 true 只代表「系统收下了链接」，名字差一个字时 iOS 是
+ *      **静默失败**的（界面什么都不发生，返回仍然 true）；
+ *   ② 脚本在**后台**跑（快捷指令里用「运行脚本」）时，iOS 不允许后台进程把别的
+ *      App 拉到前台，`openURL` 直接失败 —— 所以快捷指令要用
+ *      `scripting://run/智能体?message=…` 把 App 拉到前台再跑（见下）；
+ *   ③ 输入太长（中文经 URL 编码膨胀 9 倍，几百字就上万字符）时系统会丢掉链接，
+ *      所以超长输入改走 `input=clipboard`（先把 JSON 写进剪贴板）；
+ *   ④ 少数 iOS 版本只认 `shortcuts://x-callback-url/run-shortcut` 形式。
+ */
+async function triggerShortcut(
+  tool: AgentTool,
+  inputText: string,
+): Promise<{ ok: boolean; url: string; error: string; viaClipboard: boolean }> {
+  const inline = shortcutRunURL(tool.shortcutName ?? "", inputText)
+  if (!inline) return { ok: false, url: "", error: "缺少快捷指令名", viaClipboard: false }
+
+  const viaClipboard = !!inputText && inline.length > MAX_INLINE_URL
+  const primary = viaClipboard
+    ? shortcutRunURL(tool.shortcutName ?? "") + "&input=clipboard"
+    : inline
+  if (viaClipboard) {
+    try {
+      await Pasteboard.setString(inputText)
+    } catch {
+      // 写不进剪贴板就只能赌 URL 形式
+    }
+  }
+
+  const candidates = [primary]
+  if (primary.indexOf("shortcuts://run-shortcut") === 0) {
+    candidates.push(primary.replace("shortcuts://run-shortcut", "shortcuts://x-callback-url/run-shortcut"))
+  }
+
+  let lastError = ""
+  for (const candidate of candidates) {
+    try {
+      if (await Safari.openURL(candidate)) return { ok: true, url: candidate, error: "", viaClipboard }
+      lastError = "系统拒绝了这条链接"
+    } catch (e: any) {
+      lastError = e?.message ?? String(e)
+    }
+  }
+  console.log("打开快捷指令失败：" + lastError + " · " + primary)
+  return { ok: false, url: primary, error: lastError, viaClipboard }
 }
 
 async function executeTool(
@@ -903,19 +958,22 @@ async function executeTool(
   hooks.onEvent?.({ type: "tool", kind: "shortcut", name, target: tool.shortcutName, argsText: inputText })
 
   const t0 = Date.now()
-  const shortcutUrl = buildShortcutURL(tool, inputText)
-  // buildShortcutURL 在 shortcutName 为空时返回 ""，主动拦截防止 Safari.openURL("") 静默成功
-  if (!shortcutUrl) {
+  // shortcutName 为空时 Safari.openURL("") 会静默「成功」，这里主动拦截
+  if (!(tool.shortcutName ?? "").trim()) {
     if (cid) finishPending(cid)
     const step = makeStep("shortcut", name, "(空)", inputText, "快捷指令工具缺少 shortcutName，无法调用。", false, Date.now() - t0)
     hooks.onStep?.(step)
     return { text: "快捷指令工具缺少 shortcutName，无法调用。", step }
   }
-  const ok = await Safari.openURL(shortcutUrl)
+  const opened = await triggerShortcut(tool, inputText)
+  const ok = opened.ok
   let text: string
   if (!ok) {
     if (cid) finishPending(cid)
-    text = `执行快捷指令「${tool.shortcutName}」失败（无法打开，可能快捷指令名不存在）`
+    text = `执行快捷指令「${tool.shortcutName}」失败（${opened.error || "打不开链接"}）。`
+      + `如果名字和「快捷指令」App 里差一个字，系统是静默失败；`
+      + `如果是用「运行脚本」在后台跑的，后台本来就打不开别的 App，`
+      + `请让快捷指令用「打开 URL」调 \`scripting://run/智能体?message=…\` 把 App 拉到前台再跑。`
   } else if (tool.returns) {
     // 配了回调 URL：pending 已先落盘，快捷指令末尾「打开 URL」把结果送回来时再回填。
     // 这里不向模型补假的 role:"tool" 结果；本轮直接挂起，等 callback 带真实结果回来后再续跑。
@@ -931,6 +989,9 @@ async function executeTool(
       : `已触发快捷指令「${tool.shortcutName}」（无参数）` + tail
   }
   const step = makeStep("shortcut", name, tool.shortcutName, inputText, text, ok, Date.now() - t0)
+  step.url = opened.url
+  // 输入太长走了剪贴板：卡片上要说明白，否则用户不知道剪贴板被占用了
+  if (opened.viaClipboard) step.args = inputText + "\n（这段是通过剪贴板传进去的）"
   if (cid) {
     step.cid = cid
     if (ok && tool.returns) step.pending = true

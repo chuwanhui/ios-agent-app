@@ -1,12 +1,12 @@
 /**
  * 会话存储：会话 CRUD、工作区目录、聊天图片的落盘与清理。
  *
- * 会话数据在 `agent.sqlite` 的 `sessions` 表里（一个会话一行，`data` 是整份会话 JSON）。
- * 读走内存（启动时水合），写先改内存再落库，并且只写「真的变了」的那些行。
+ * 会话数据在 `agent/data/sessions/` 下（一个会话一个文件，内容是整份会话 JSON）。
+ * 读走内存（启动时水合），写先改内存再落盘，并且只写「真的变了」的那几个文件。
  */
 import { ChatMessage, Session, SessionStore } from "./types"
 import { IMAGES_DIR, NEW_SESSION_TITLE, WORKSPACES_DIR } from "./paths"
-import { all, kvStep, kvText, tx } from "../db/db"
+import { deleteItem, kvJson, kvWriteJson, listItems, writeItem } from "../store/store"
 
 // ———————————————————————— 会话 ————————————————————————
 
@@ -14,10 +14,9 @@ import { all, kvStep, kvText, tx } from "../db/db"
 let storeCache: SessionStore | null = null
 
 interface Persisted {
-  /** 上次落库时的会话对象引用：引用没变说明没人动过，连 stringify 都省了。 */
+  /** 上次落盘时的会话对象引用：引用没变说明没人动过，连 stringify 都省了。 */
   ref: Session
   json: string
-  position: number
 }
 
 /** 已落库的快照，用来判断哪一行要写。 */
@@ -133,33 +132,29 @@ export function deriveTitle(messages: ChatMessage[]): string {
 
 // ———————————————————————— 读 / 写库 ————————————————————————
 
-/** 启动时把会话从库里装进内存（不含图片文件，图片仍然在 images/ 目录）。 */
+/** 启动时把会话从磁盘装进内存（不含图片文件，图片仍然在 images/ 目录）。 */
 export async function hydrateSessions(): Promise<void> {
-  const rows = await all<{ id: string; position: number; data: string }>(
-    "SELECT id, position, data FROM sessions ORDER BY position ASC",
-  )
   const sessions: Session[] = []
   const next = new Map<string, Persisted>()
-  for (const row of rows) {
+  for (const raw of listItems<Session>("sessions")) {
+    if (!raw || typeof raw !== "object" || !raw.id) continue
+    let json: string
     try {
-      const parsed = JSON.parse(row.data) as Session
-      if (!parsed || !parsed.id) continue
-      const session = migrateSession(parsed)
-      if (!Array.isArray(session.messages)) session.messages = []
-      sessions.push(session)
-      next.set(session.id, { ref: session, json: row.data, position: Number(row.position) || 0 })
+      json = JSON.stringify(raw)
     } catch {
-      // 坏行跳过：单个会话损坏不该让整个历史打不开
+      // 坏文件跳过：单个会话损坏不该让整个历史打不开
+      continue
     }
+    const session = migrateSession(raw)
+    if (!Array.isArray(session.messages)) session.messages = []
+    sessions.push(session)
+    next.set(session.id, { ref: session, json })
   }
+  // 最近更新的排前面：侧边栏本来就按 updatedAt 排，内存里也照这个来，省得两边不一致。
+  sessions.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
   persisted = next
-  let currentId: string | null = null
-  try {
-    const raw = await kvText("sessions.current")
-    currentId = raw ? (JSON.parse(raw) as string | null) : null
-  } catch {
-    currentId = null
-  }
+  const stored = kvJson<string | null>("sessions.current")
+  let currentId: string | null = typeof stored === "string" && stored ? stored : null
   if (!sessions.some((s) => s.id === currentId)) currentId = sessions[0]?.id ?? null
   storeCache = { currentId, sessions }
 }
@@ -180,44 +175,39 @@ export function saveStore(store: SessionStore): Promise<void> {
   })
 }
 
-/** 逐行比对，只写变过的会话、只删真没了的会话。 */
+/** 逐个比对，只写变过的会话、只删真没了的会话。写文件是同步的。 */
 async function persistStore(store: SessionStore): Promise<void> {
-  const steps: SQLite.TransactionStep[] = []
   const alive = new Set<string>()
 
-  store.sessions.forEach((session, position) => {
+  for (const session of store.sessions) {
     alive.add(session.id)
     const prev = persisted.get(session.id)
-    if (prev && prev.ref === session && prev.position === position) return
+    if (prev && prev.ref === session) continue
     let json: string
     try {
       json = JSON.stringify(session)
     } catch {
-      return
+      continue
     }
-    if (prev && prev.json === json && prev.position === position) {
-      persisted.set(session.id, { ref: session, json, position })
-      return
+    if (prev && prev.json === json) {
+      persisted.set(session.id, { ref: session, json })
+      continue
     }
-    steps.push({
-      sql: `INSERT INTO sessions (id, position, updated_at, data) VALUES (?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              position = excluded.position,
-              updated_at = excluded.updated_at,
-              data = excluded.data`,
-      args: [session.id, position, Number(session.updatedAt) || 0, json],
-    })
-    persisted.set(session.id, { ref: session, json, position })
-  })
+    try {
+      writeItem("sessions", session.id, session)
+      persisted.set(session.id, { ref: session, json })
+    } catch (e: any) {
+      console.log("保存会话失败：" + (e?.message ?? String(e)))
+    }
+  }
 
   for (const id of Array.from(persisted.keys())) {
     if (alive.has(id)) continue
     persisted.delete(id)
-    steps.push({ sql: "DELETE FROM sessions WHERE id = ?", args: [id] })
+    deleteItem("sessions", id)
   }
 
-  steps.push(kvStep("sessions.current", JSON.stringify(store.currentId ?? null)))
-  await tx(steps)
+  kvWriteJson("sessions.current", store.currentId ?? null)
 }
 
 /** 保证 store 里有一个可用的当前会话（没有就新建一个并放到最前）。 */

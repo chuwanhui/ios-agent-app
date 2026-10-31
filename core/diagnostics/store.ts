@@ -1,4 +1,4 @@
-import { all, exec, tx } from "../db/db"
+import { clearItems, deleteItem, listItems, writeItem } from "../store/store"
 
 /**
  * 运行诊断：每跑一轮（聊天 / 通知 / 回传续跑 / 记忆压缩）就在本地记一条。
@@ -43,21 +43,23 @@ const ERROR_CLIP = 200
 /** 内存副本（启动时由 hydrateRunLog 填好），按时间倒序。 */
 let cache: RunLogEntry[] | null = null
 
+/**
+ * 一条诊断在磁盘上的文件名。
+ *
+ * 条目本身没有 id（它是「一次运行」，天然由时间戳区分），所以文件名用
+ * 「时间 + 来源 + 耗时」拼一个稳定的串：既够唯一，又能在裁剪时算出该删哪个。
+ */
+export function runIdOf(entry: RunLogEntry): string {
+  return `run-${Number(entry.at) || 0}-${entry.source || "other"}-${Number(entry.ms) || 0}`
+}
+
 export async function hydrateRunLog(): Promise<void> {
-  const rows = await all<{ data: string }>(
-    "SELECT data FROM runs ORDER BY at DESC LIMIT ?",
-    [MAX_ENTRIES],
-  )
   const list: RunLogEntry[] = []
-  for (const row of rows) {
-    try {
-      const entry = JSON.parse(row.data)
-      if (entry && typeof entry.at === "number") list.push(entry as RunLogEntry)
-    } catch {
-      // 坏行跳过
-    }
+  for (const entry of listItems<RunLogEntry>("runs")) {
+    if (entry && typeof entry.at === "number") list.push(entry)
   }
-  cache = list
+  list.sort((a, b) => b.at - a.at)
+  cache = list.slice(0, MAX_ENTRIES)
 }
 
 export function loadRunLog(): RunLogEntry[] {
@@ -66,21 +68,19 @@ export function loadRunLog(): RunLogEntry[] {
 
 /** 记一条。永远不抛错：诊断写失败不能影响正常对话。 */
 export function logRun(entry: RunLogEntry): void {
-  cache = [entry, ...(cache ?? [])].slice(0, MAX_ENTRIES)
-  void tx([
-    { sql: "INSERT INTO runs (at, data) VALUES (?, ?)", args: [entry.at, JSON.stringify(entry)] },
-    {
-      sql: "DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY at DESC LIMIT ?)",
-      args: [MAX_ENTRIES],
-    },
-  ]).catch(() => {
-    // 写不进去就算了
-  })
+  const prev = cache ?? []
+  cache = [entry, ...prev].slice(0, MAX_ENTRIES)
+  try {
+    writeItem("runs", runIdOf(entry), entry)
+    for (const dropped of prev.slice(MAX_ENTRIES - 1)) deleteItem("runs", runIdOf(dropped))
+  } catch {
+    // 写不进去就算了：诊断失败不能影响正常对话
+  }
 }
 
 export function clearRunLog(): void {
   cache = []
-  void exec("DELETE FROM runs").catch(() => {})
+  clearItems("runs")
 }
 
 /** 错误信息压成一行，避免把整段堆栈写进诊断文件。 */

@@ -1,5 +1,6 @@
 import { fetch } from "scripting"
 import { McpServer } from "../agent/store"
+import { kvJson, kvWriteJson } from "../store/store"
 
 /**
  * 极简 MCP 客户端：JSON-RPC 2.0 over Streamable HTTP。
@@ -51,6 +52,23 @@ type SessionState = { sessionId: string | null; ready: boolean }
 const sessions = new Map<string, SessionState>()
 const toolCache = new Map<string, { tools: McpTool[]; at: number }>()
 const failCache = new Map<string, { error: string; at: number }>()
+
+/**
+ * 冷启动也要能用：上面两个 Map 只活在一个进程里，而快捷指令 / 小组件每次都是新进程，
+ * 等于每次都要重新握手 + 拉一遍工具清单（服务器失联时还要干等超时）。
+ * 所以把结果也写进 kv，键名用哈希 —— token 不能出现在文件名里。
+ */
+function diskKeyOf(key: string, kind: string): string {
+  let h = 5381
+  for (let i = 0; i < key.length; i++) h = ((h * 33) ^ key.charCodeAt(i)) >>> 0
+  return `mcp.${kind}.` + h.toString(36)
+}
+
+function readToolDisk(key: string): { tools: McpTool[]; at: number } | null {
+  const v = kvJson<any>(diskKeyOf(key, "tools"))
+  if (!v || !Array.isArray(v.tools)) return null
+  return { tools: v.tools as McpTool[], at: Number(v.at) || 0 }
+}
 
 // ———————————————————————— 小工具 ————————————————————————
 
@@ -307,13 +325,17 @@ async function ensureSession(s: McpServer): Promise<void> {
 /** 拉取某个服务器的工具清单（带 5 分钟缓存）。失败不抛异常，返回 error。 */
 export async function listMcpTools(s: McpServer, force = false): Promise<McpToolList> {
   const key = keyOf(s)
-  const cached = toolCache.get(key)
-  if (!force && cached && Date.now() - cached.at < TOOL_CACHE_MS) {
-    return { serverId: s.id, serverName: s.name, tools: cached.tools }
-  }
-  const failed = failCache.get(key)
-  if (!force && failed && Date.now() - failed.at < FAIL_CACHE_MS) {
-    return { serverId: s.id, serverName: s.name, tools: [], error: failed.error }
+
+  if (!force) {
+    const cached = toolCache.get(key) ?? readToolDisk(key)
+    if (cached && Date.now() - cached.at < TOOL_CACHE_MS) {
+      toolCache.set(key, cached)
+      return { serverId: s.id, serverName: s.name, tools: cached.tools }
+    }
+    const failed = failCache.get(key)
+    if (failed && Date.now() - failed.at < FAIL_CACHE_MS) {
+      return { serverId: s.id, serverName: s.name, tools: [], error: failed.error }
+    }
   }
 
   try {
@@ -345,6 +367,7 @@ export async function listMcpTools(s: McpServer, force = false): Promise<McpTool
     }
     toolCache.set(key, { tools, at: Date.now() })
     failCache.delete(key)
+    kvWriteJson(diskKeyOf(key, "tools"), { tools, at: Date.now() })
     return { serverId: s.id, serverName: s.name, tools }
   } catch (e: any) {
     resetSession(s)

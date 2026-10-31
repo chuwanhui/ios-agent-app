@@ -9,7 +9,7 @@
  * 模型真正要用时再调 read_skill 工具读完整说明，省 token。
  */
 
-import { kvJson, kvWriteJson } from "../db/db"
+import { kvJson, kvWriteJson } from "../store/store"
 
 /** 用户丢技能包的目录（在「文件」App 里可见）。 */
 export const SKILL_INBOX = FileManager.documentsDirectory + "/技能"
@@ -18,7 +18,7 @@ export const SKILL_DONE = SKILL_INBOX + "/已导入"
 const AGENT_DIR = FileManager.appGroupDocumentsDirectory + "/agent"
 /** 技能包正文目录（文件，不动）。 */
 const SKILLS_DIR = AGENT_DIR + "/skills"
-/** 注册表在 kv 表里的键。 */
+/** 注册表在 kv 里的键。 */
 const SKILL_REG_KEY = "skills.registry"
 const SKILL_FILE = "SKILL.md"
 
@@ -83,7 +83,7 @@ function repairRegistry(reg: SkillRegistry): SkillRegistry {
 export async function hydrateSkills(): Promise<void> {
   let reg = emptyRegistry()
   try {
-    const parsed = await kvJson<SkillRegistry>(SKILL_REG_KEY)
+    const parsed = kvJson<SkillRegistry>(SKILL_REG_KEY)
     if (parsed && Array.isArray(parsed.skills)) reg = { version: 1, skills: parsed.skills }
   } catch {
     reg = emptyRegistry()
@@ -105,9 +105,7 @@ export function loadRegistry(_force = false): SkillRegistry {
 
 export function saveRegistry(reg: SkillRegistry): void {
   cache = reg
-  void kvWriteJson(SKILL_REG_KEY, reg).catch((e) => {
-    console.log("保存技能注册表失败：" + (e?.message ?? String(e)))
-  })
+  kvWriteJson(SKILL_REG_KEY, reg)
 }
 
 export function listSkills(): SkillMeta[] {

@@ -8,6 +8,7 @@ import {
   LOCK_HEARTBEAT_MS, NotifyEnvelope, acquireQueueLock, dueQueueItems, markQueueRetry,
   markQueueSuccess, refreshQueueLock, releaseQueueLock,
 } from "./queue"
+import { memoryKeyOf, notifyTitle, notifyUserText, senderSessionFor } from "./session"
 
 /**
  * 通知队列的消费者。
@@ -28,29 +29,7 @@ const DRAIN_BATCH = 8
 const LOCK_WAIT_MS = 20_000
 const LOCK_SPIN_MS = 350
 
-function normalizeKeyPart(s: string): string {
-  return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ")
-}
-
-/** 记忆绑定键：同一个 App 的同一个人共用一段记忆。 */
-export function memoryKeyOf(app: string, sender: string): string {
-  return `${normalizeKeyPart(app)}:${normalizeKeyPart(sender)}`
-}
-
-function titleForNotification(app: string, sender: string): string {
-  return `${sender}（${app}）`
-}
-
-function userTextForNotification(n: NotifyEnvelope): string {
-  return [
-    "【通知消息】",
-    `来源应用：${n.app}`,
-    `发件人：${n.sender}`,
-    `消息内容：${n.content}`,
-    "",
-    "请结合该发件人的历史记忆与可用知识库/工具进行回复；需要发送时调用对应发送工具。",
-  ].join("\n")
-}
+/* App+发件人 → 会话的那套绑定关系搬去 ./session 了，两个入口共用一份。 */
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
@@ -69,17 +48,7 @@ async function waitQueueLock(owner: string, timeoutMs = LOCK_WAIT_MS): Promise<b
 export async function processNotification(cfg: AgentConfig, envelope: NotifyEnvelope): Promise<string> {
   const store = loadStore()
   const key = memoryKeyOf(envelope.app, envelope.sender)
-  const found = store.sessions.find((s) => s.memoryKey === key)
-  let session: Session
-  if (found) {
-    session = expireSessionIfNeeded(found)
-  } else {
-    const s = makeSession("default")
-    s.memoryKey = key
-    s.title = titleForNotification(envelope.app, envelope.sender)
-    s.updatedAt = Date.now()
-    session = s
-  }
+  const session = expireSessionIfNeeded(senderSessionFor(store, envelope.app, envelope.sender))
 
   const compressed = await compressHistory(cfg, session)
   const runtimeCfg: AgentConfig = compressed.memorySummary
@@ -94,7 +63,7 @@ export async function processNotification(cfg: AgentConfig, envelope: NotifyEnve
     : cfg
 
   const { reply, newHistory } = await runAgent(
-    userTextForNotification(envelope),
+    notifyUserText(envelope),
     runtimeCfg,
     compressed.messages,
     undefined,
@@ -105,7 +74,7 @@ export async function processNotification(cfg: AgentConfig, envelope: NotifyEnve
   await saveStore(
     upsertSession({ ...store, currentId: compressed.id }, {
       ...compressed,
-      title: titleForNotification(envelope.app, envelope.sender),
+      title: notifyTitle(envelope.app, envelope.sender),
       messages: capped,
       updatedAt: Date.now(),
       memoryKey: key,

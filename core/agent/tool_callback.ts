@@ -10,9 +10,9 @@
  * 这样 callback 不会被伪装成用户消息，OpenAI 兼容协议里的工具调用链也是完整的。
  */
 import { ChatMessage, Session, SessionStore, ToolStep, loadStore, saveStore, upsertSession } from "./store"
-import { kvJson, kvWriteJson } from "../db/db"
+import { kvJson, kvWriteJson } from "../store/store"
 
-/** 待回传记录在 kv 表里的键（默认 10 分钟有效，App 被杀掉也还在）。 */
+/** 待回传记录在 kv 里的键（默认 10 分钟有效，App 被杀掉也还在）。 */
 const PENDING_KEY = "tools.pending"
 
 /** 超过这么久还没回传，就当成「这个快捷指令其实没配回传」，把记录清掉。 */
@@ -46,7 +46,7 @@ interface PendingFile {
 }
 
 export async function hydratePending(): Promise<void> {
-  const parsed = await kvJson<Partial<PendingFile>>(PENDING_KEY)
+  const parsed = kvJson<Partial<PendingFile>>(PENDING_KEY)
   pendingCache = {
     pending: Array.isArray(parsed?.pending) ? (parsed!.pending as PendingCall[]) : [],
     done: Array.isArray(parsed?.done) ? (parsed!.done as PendingFile["done"]) : [],
@@ -64,10 +64,8 @@ function writeFile(f: PendingFile): void {
     done: f.done.slice(-MAX_DONE),
   }
   pendingCache = next
-  void kvWriteJson(PENDING_KEY, next).catch((e) => {
-    // 落库失败就当没有 pending：只是回填不上过程卡片，不影响触发本身
-    console.log("保存回传待办失败：" + (e?.message ?? String(e)))
-  })
+  // 落盘失败就当没有 pending：只是回填不上过程卡片，不影响触发本身
+  kvWriteJson(PENDING_KEY, next)
 }
 
 /** 丢掉过期记录（挂掉 / 没配回传的快捷指令留下的残渣）。 */
@@ -194,9 +192,10 @@ function findStep(
  */
 export function handleCallback(params: any): CallbackOutcome | null {
   const reply = parseReplyEnvelope(params)
+  const plainError = pickText(params, ["error", "错误"])
   const result = reply
     ? (reply.ok ? reply.output : `执行失败：${reply.error || reply.output || "未知错误"}`)
-    : callbackResultOf(params)
+    : (callbackResultOf(params) || (plainError ? `执行失败：${plainError}` : ""))
   if (!result) return null
 
   const now = Date.now()

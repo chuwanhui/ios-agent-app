@@ -1,7 +1,7 @@
 /**
  * 配置的读 / 写 / 迁移。
  *
- * 配置在 `agent.sqlite` 的 `kv` 表（key = `config`）。读走内存（启动时水合），
+ * 配置在 `agent/data/kv/config.json`。读走内存（启动时水合），
  * 写先改内存再落库。密钥不进库也不进文件，只进 Keychain，库里存的是脱敏版本。
  */
 import { AgentConfig } from "./types"
@@ -9,7 +9,7 @@ import { DEFAULT_CONFIG } from "./defaults"
 import { DEFAULT_PERSONA } from "./prompts"
 import { keychainGet, keychainSet } from "./keychain"
 import { mergeConfigPatch, syncActiveProvider, withLegacyProvider } from "./provider"
-import { kvJson, kvWriteJson } from "../db/db"
+import { kvJson, kvWriteJson } from "../store/store"
 
 const KV_KEY = "config"
 
@@ -92,7 +92,7 @@ function factoryConfig(): AgentConfig {
 export async function hydrateConfig(): Promise<void> {
   let parsed: any = null
   try {
-    parsed = await kvJson<Record<string, any>>(KV_KEY)
+    parsed = kvJson<Record<string, any>>(KV_KEY)
   } catch {
     parsed = null
   }
@@ -140,13 +140,13 @@ export function loadConfig(): AgentConfig {
   return cache
 }
 
-/** 存配置：先写 Keychain（同步），再落库。 */
+/** 存配置：先写 Keychain，再落盘。文件写入是同步的，返回时已经写完。 */
 export async function saveConfig(cfg: AgentConfig): Promise<void> {
   const out = syncActiveProvider(cfg)
   cache = out
-  // 先通知（内存已经是新值），再等落库：界面不必等磁盘。
+  // 先通知（内存已经是新值），再落盘。
   notifyConfigChanged()
-  await kvWriteJson(KV_KEY, redactSecrets(out))
+  kvWriteJson(KV_KEY, redactSecrets(out))
 }
 
 /** 配置项的键名，供快捷指令传 JSON 时识别。 */
